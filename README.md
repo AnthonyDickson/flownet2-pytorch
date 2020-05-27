@@ -24,16 +24,16 @@ A batchnorm version for each network is also available.
 ## Custom layers
 
 `FlowNet2` or `FlowNet2C*` achitectures rely on custom layers `Resample2d` or `Correlation`. <br />
-A pytorch implementation of these layers with cuda kernels are available at [./networks](./networks). <br />
+A pytorch implementation of these layers with cuda kernels are available at [./networks](networks). <br />
 Note : Currently, half precision kernels are not available for these layers.
 
 ## Data Loaders
 
-Dataloaders for FlyingChairs, FlyingThings, ChairsSDHom and ImagesFromFolder are available in [datasets.py](./datasets.py). <br />
+Dataloaders for FlyingChairs, FlyingThings, ChairsSDHom and ImagesFromFolder are available in [datasets.py](datasets.py). <br />
 
 ## Loss Functions
 
-L1 and L2 losses with multi-scale support are available in [losses.py](./losses.py). <br />
+L1 and L2 losses with multi-scale support are available in [losses.py](losses.py). <br />
 
 ## Installation 
 
@@ -84,7 +84,7 @@ We've included caffe pre-trained models. Should you use these pre-trained weight
     --validation_dataset MpiSintelClean --validation_dataset_root /path/to/mpi-sintel/clean/dataset
     
 ## Results on MPI-Sintel
-[![Predicted flows on MPI-Sintel](./image.png)](https://www.youtube.com/watch?v=HtBmabY8aeU "Predicted flows on MPI-Sintel")
+[![Predicted flows on MPI-Sintel](image.png)](https://www.youtube.com/watch?v=HtBmabY8aeU "Predicted flows on MPI-Sintel")
 
 ## Reference 
 If you find this implementation useful in your work, please acknowledge it appropriately and cite the paper:

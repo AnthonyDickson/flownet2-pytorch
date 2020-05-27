@@ -2,6 +2,11 @@
 .torch
 _ext
 *.o
-work
+*.egg
+*.so
+flownet2/work
 work/*
 _ext/
+data/
+output/
+checkpoints/
