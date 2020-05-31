@@ -39,13 +39,13 @@ class TimerBlock:
             self.log("Operation finished\n")
 
 
-    def log(self, string):
+    def log(self, string, end="\n"):
         duration = time.clock() - self.start
         units = 's'
         if duration > 60:
             duration = duration / 60.
             units = 'm'
-        print(("  [{:.3f}{}] {}".format(duration, units, string)))
+        print(("  [{:.3f}{}] {}".format(duration, units, string)), end=end)
     
     def log2file(self, fid, string):
         fid = open(fid, 'a')
