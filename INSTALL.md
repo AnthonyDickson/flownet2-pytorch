@@ -1,5 +1,5 @@
 # Ubuntu 18.04
-1.  Ensure NVIDIA GPU drivers are installed - `nvidia-smi` is the quickest way.
+1.  Ensure NVIDIA GPU drivers are installed - `nvidia-smi` is the quickest way to check.
 2.  Install Docker.
 3.  Install [nvidia-docker](https://github.com/NVIDIA/nvidia-docker).
 4.  Download checkpoint file(s) from the links listed in the [README file](README.md).
