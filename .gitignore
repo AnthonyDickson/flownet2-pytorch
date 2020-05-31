@@ -10,3 +10,4 @@ _ext/
 data/
 output/
 checkpoints/
+.cache/

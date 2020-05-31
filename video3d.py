@@ -1,5 +1,6 @@
 import math
 import os
+import pickle
 from collections import defaultdict
 from typing import List, Tuple, DefaultDict, Optional, Iterable, Collection, Container, Union
 
@@ -61,7 +62,7 @@ def parse_cameras(txt_file):
 
 
 class CameraPose:
-    def __init__(self, R, t):
+    def __init__(self, R=Rotation.identity(), t=np.zeros(shape=(3, 1))):
         self.R = R
         self.t = t
 
@@ -72,7 +73,7 @@ class CameraPose:
         qw, qx, qy, qz, tx, ty, tz = tuple(line_parts)
 
         R = Rotation.from_quat([qx, qy, qz, qw])
-        t = np.array([tx, ty, tz]).T
+        t = np.array([[tx, ty, tz]]).T
 
         return CameraPose(R, t)
 
@@ -99,7 +100,7 @@ class Point2D:
 
 
 def parse_images(txt_file) -> Tuple[DefaultDict[int, Optional[CameraPose]], DefaultDict[int, List[Point2D]]]:
-    poses = defaultdict(lambda: None)
+    poses = defaultdict(Camera)
     points = defaultdict(list)
 
     with open(txt_file, 'r') as f:
@@ -150,8 +151,13 @@ class Track:
 
 
 class Point3D:
-    def __init__(self, point3d_id: int, x: float, y: float, z: float, r: int, g: int, b: int, error: float,
-                 track: List[Track]):
+    def __init__(self, point3d_id: int = -1,
+                 x: float = 0.0, y: float = 0.0, z: float = 0.0,
+                 r: int = 0, g: int = 0, b: int = 0,
+                 error: float = float('nan'), track=None):
+        if track is None:
+            track = []
+
         self.point3d_id = int(point3d_id)
         self.x = float(x)
         self.y = float(y)
@@ -173,7 +179,7 @@ class Point3D:
 
 
 def parse_points(txt_file) -> DefaultDict[int, Optional[Point3D]]:
-    points = defaultdict(lambda: None)
+    points = defaultdict(Point3D)
 
     with open(txt_file, 'r') as f:
         for line in f:
@@ -187,7 +193,7 @@ def parse_points(txt_file) -> DefaultDict[int, Optional[Point3D]]:
 
 
 def sample_frame_pairs(num_frames):
-    frame_pairs = {(i, i + 1) for i in range(num_frames)}
+    frame_pairs = {(i, i + 1) for i in range(num_frames - 1)}
 
     for l in range(math.floor(math.log2(num_frames - 1)) + 1):
         sl = {(i, i + 2 ** l) for i in range(num_frames - 2 ** l) if i % 2 ** (l - 1) == 0}
@@ -216,35 +222,54 @@ class NumpyDataset(Dataset):
         return len(self.arrays)
 
 
-@plac.annotations(
-    # cameras_txt=plac.Annotation("The camera intrinsics txt file exported from COLMAP."),
-    # images_txt=plac.Annotation("The image data txt file exported from COLMAP."),
-    # points_3d_txt=plac.Annotation("The 3D points txt file exported from COLMAP."),
-    colmap_output_path=plac.Annotation(
-        "The path to the folder containing the text files `cameras.txt`, `images.txt` and `points3D.txt`."),
-    video_path=plac.Annotation('The path to the source video file.', type=str,
-                               kind='option', abbrev='i'),
-    model_path=plac.Annotation("The path to the pretrained MiDaS model weights.", type=str, kind="option", abbrev='m'),
-)
-def main(colmap_output_path: str, video_path: str, model_path: str = "model.pt"):
-    with TimerBlock("Parse COLMAP Output") as block:
-        cameras_txt = os.path.join(colmap_output_path, "cameras.txt")
-        images_txt = os.path.join(colmap_output_path, "images.txt")
-        points_3d_txt = os.path.join(colmap_output_path, "points3D.txt")
+# TODO: Add flag for clearing cache.
+def generate_depth_maps(model, video_dataset, width, height, logger, dnn_depth_map_cache_path):
+    try:
+        depth_maps = np.load(dnn_depth_map_cache_path)
+        logger.log(f"Loaded DNN depth maps from {dnn_depth_map_cache_path}.")
+    except IOError:
+        depth_maps = []
+        sequential_dataloader = DataLoader(video_dataset, batch_size=8, shuffle=False)
+        frame_i = 0
 
-        camera = parse_cameras(cameras_txt)[0]
-        block.log("Parsed camera intrinsics.")
+        with torch.no_grad():
+            for batch in sequential_dataloader:
+                imgs = batch["image"]
+                imgs = imgs.cuda()
+                prediction = model(imgs)
+                depth_maps.append(prediction.cpu())
 
-        poses_by_image, points2d_by_image = parse_images(images_txt)
-        block.log("Parsed camera poses and 2D points.")
+                frame_i += imgs.shape[0]
+                logger.log(f"Generated {frame_i:02d} frames.\r", end="")
 
-        points3d_by_id = parse_points(points_3d_txt)
-        block.log("Parsed 3D points.")
+        logger.log(f"Generated {len(depth_maps)} depth maps.")
 
+        depth_maps = torch.cat(depth_maps, dim=0)
+        logger.log("Concatenated depth maps.")
+
+        output_shape = depth_maps.shape[-2:]
+
+        depth_maps = torch.nn.functional.interpolate(depth_maps.unsqueeze(1), size=(width, height),
+                                                     mode='bilinear', align_corners=True)
+
+        # Network produces output as NCWH - dropped channel since output is B&W and just need to change to NHW.
+        depth_maps = depth_maps.squeeze().permute((0, 2, 1)).to(torch.float32).cpu().numpy()
+        logger.log(f"Resized depth maps back to {depth_maps.shape[-2:]} from {output_shape}.")
+
+        np.save(dnn_depth_map_cache_path, depth_maps)
+        logger.log(f"Saved DNN depth maps to {dnn_depth_map_cache_path}.")
+    return depth_maps
+
+
+def generate_sparse_depth_maps(camera, points2d_by_image, points3d_by_id, logger, sparse_depth_map_cache_path):
+    try:
+        sparse_depth_maps = np.load(sparse_depth_map_cache_path)
+        logger.log(f"Loaded sparse depth maps from {sparse_depth_map_cache_path}.")
+    except IOError:
         sparse_depth_maps = []
 
         for points in points2d_by_image.values():
-            depth_map = np.zeros(shape=camera.shape)
+            depth_map = np.zeros(shape=camera.shape, dtype=np.float32)
 
             for point in points:
                 if point.point3d_id > -1 and point.x <= depth_map.shape[1] and point.y <= depth_map.shape[0]:
@@ -254,18 +279,68 @@ def main(colmap_output_path: str, video_path: str, model_path: str = "model.pt")
 
             sparse_depth_maps.append(depth_map)
 
-        sparse_depth_maps = np.array(sparse_depth_maps)
+        sparse_depth_maps = np.array(sparse_depth_maps, dtype=np.float32)
+        logger.log("Generated sparse depth maps for each frame.")
 
-        block.log("Generated sparse depth maps for each frame.")
+        np.save(sparse_depth_map_cache_path, sparse_depth_maps)
+        logger.log(f"Saved sparse depth maps to {sparse_depth_map_cache_path}.")
+    return sparse_depth_maps
 
-    with TimerBlock("Load Video and Depth Estimation Model") as block:
+
+@plac.annotations(
+    colmap_output_path=plac.Annotation(
+        "The path to the folder containing the text files `cameras.txt`, `images.txt` and `points3D.txt`."),
+    video_path=plac.Annotation('The path to the source video file.', type=str,
+                               kind='option', abbrev='i'),
+    model_path=plac.Annotation("The path to the pretrained MiDaS model weights.", type=str, kind="option", abbrev='m'),
+    cache_path=plac.Annotation("Where to save and load intermediate results to and from.", type=str, kind="option",
+                               abbrev="c")
+)
+def main(colmap_output_path: str, video_path: str, model_path: str = "model.pt", cache_path: str = ".cache"):
+    cache_path = os.path.abspath(cache_path)
+    video_name = os.path.basename(video_path)
+    cache_path = os.path.join(cache_path, video_name)
+    colmap_cache_path = os.path.join(cache_path, "parsed_colmap_output.pkl")
+    sparse_depth_map_cache_path = os.path.join(cache_path, "sparse_depth_map.npy")
+    dnn_depth_map_cache_path = os.path.join(cache_path, "dnn_depth_map.npy")
+    relative_depth_scale_cache_path = os.path.join(cache_path, "relative_depth_scale.pkl")
+    # aligned_frame_pairs_cache_path = os.path.join(cache_path, "aligned_frame_pairs.npy")
+
+    with TimerBlock("Parse COLMAP Output") as block:
+        try:
+            with open(colmap_cache_path, 'rb') as f:
+                camera, poses_by_image, points2d_by_image, points3d_by_id = pickle.load(f)
+
+            block.log(f"Loaded parsed COLMAP output from {colmap_cache_path}.")
+        except FileNotFoundError:
+            cameras_txt = os.path.join(colmap_output_path, "cameras.txt")
+            images_txt = os.path.join(colmap_output_path, "images.txt")
+            points_3d_txt = os.path.join(colmap_output_path, "points3D.txt")
+
+            camera = parse_cameras(cameras_txt)[0]
+            block.log("Parsed camera intrinsics.")
+
+            poses_by_image, points2d_by_image = parse_images(images_txt)
+            block.log("Parsed camera poses and 2D points.")
+
+            points3d_by_id = parse_points(points_3d_txt)
+            block.log("Parsed 3D points.")
+
+            if not os.path.isdir(cache_path):
+                os.makedirs(cache_path)
+
+            with open(colmap_cache_path, 'wb') as f:
+                pickle.dump((camera, poses_by_image, points2d_by_image, points3d_by_id), f)
+
+            block.log(f"Saved parsed COLMAP output to {colmap_cache_path}.")
+
+    with TimerBlock("Load Video") as block:
         input_video = cv2.VideoCapture(video_path)
-        frame_i = 0
 
         if not input_video.isOpened():
-            raise RuntimeError(f"Could not open video from path `{video_path}`.")
+            raise RuntimeError(f"Could not open video from the path {video_path}.")
 
-        block.log(f"Opened video from path `{video_path}`.")
+        block.log(f"Opened video from path the {video_path}.")
 
         frames = []
 
@@ -289,6 +364,7 @@ def main(colmap_output_path: str, video_path: str, model_path: str = "model.pt")
         if input_video.isOpened():
             input_video.release()
 
+    with TimerBlock("Calculate Relative Depth Scaling Factor") as block:
         transform = Compose(
             [
                 Resize(
@@ -316,57 +392,59 @@ def main(colmap_output_path: str, video_path: str, model_path: str = "model.pt")
         model.eval()
         block.log("Loaded depth estimation model.")
 
-    with TimerBlock("Calculate Relative Depth Scaling Factor") as block:
-        relative_depth_scales = []
-        depth_maps = []
-        sequential_dataloader = DataLoader(video_dataset, batch_size=8, shuffle=False)
+        try:
+            with open(relative_depth_scale_cache_path, 'rb') as f:
+                relative_depth_scale = pickle.load(f)
 
-        with torch.no_grad():
-            for batch in sequential_dataloader:
-                imgs = batch["image"]
-                imgs = imgs.cuda()
-                prediction = model(imgs)
-                depth_maps.append(prediction.cpu())
+            block.log(f"Loaded relative depth scale from {relative_depth_scale_cache_path}")
+        except FileNotFoundError:
+            depth_maps = generate_depth_maps(model, video_dataset, width, height, block, dnn_depth_map_cache_path)
 
-                frame_i += imgs.shape[0]
-                block.log(f"Frame {frame_i:02d}\r", end="")
+            sparse_depth_maps = generate_sparse_depth_maps(camera, points2d_by_image, points3d_by_id, block,
+                                                           sparse_depth_map_cache_path)
 
-        print()
-        block.log(f"Generated {len(depth_maps)} depth maps.")
+            zero_mask = sparse_depth_maps == 0
 
-        stacked_depth_maps = torch.stack(depth_maps, dim=0)
+            relative_depth_scale = np.divide(depth_maps, sparse_depth_maps, dtype=np.float32)
+            relative_depth_scale[zero_mask] = np.nan
+            relative_depth_scale = np.nanmedian(relative_depth_scale, axis=[1, 2])
+            relative_depth_scale = np.mean(relative_depth_scale)
+            block.log(f"Calculated relative depth scale factor: {relative_depth_scale:.2f}.")
 
-        depth_maps = torch.nn.functional.interpolate(stacked_depth_maps, size=(width, height),
-                                                     mode='bilinear', align_corners=True)
-        depth_maps = depth_maps.squeeze().permute((1, 0))
-        depth_maps = depth_maps.cpu().numpy()
+            with open(relative_depth_scale_cache_path, 'wb') as f:
+                pickle.dump(relative_depth_scale, f)
 
-        relative_depth_scale = np.mean(relative_depth_scales)
+            block.log(f"Saved relative depth scale factor to {relative_depth_scale_cache_path}.")
 
-        block.log(f"Calculated relative depth scale factor: {relative_depth_scale:.2f}.")
-
-    with TimerBlock("Sample Frame Pairs") as block:
+    with TimerBlock("Generate Dense Optical Flow") as block:
         frame_pair_indexes = sample_frame_pairs(num_frames)
         block.log("Sampled frame pairs")
 
-    with TimerBlock("Align Frame Pairs") as block:
-        frame_pairs = []
-
-        for i, j in frame_pair_indexes:
-            frame_pairs.append((frames[i], align_images(frames[i], frames[j])))
-
-        block.log(f"Aligned {len(frame_pairs)} frame pairs.")
-
-    with TimerBlock("Generate Dense Optical Flow") as block:
-        pass
-
-    with TimerBlock("Filter Frame Pairs") as block:
-        pass
+        # try:
+        #     aligned_frame_pairs = np.load(aligned_frame_pairs_cache_path)
+        #     block.log(f"Loaded aligned frame pairs from {aligned_frame_pairs_cache_path}.")
+        # except IOError:
+        #     aligned_frame_pairs = []
+        #
+        #     for pair_index, (i, j) in enumerate(frame_pair_indexes):
+        #         aligned_frame = align_images(frames[i], frames[j])
+        #         aligned_frame_pairs.append((pair_index, aligned_frame.astype(np.float32)))
+        #         block.log(f"Aligned {pair_index + 1} out of {len(frame_pair_indexes)} frame pairs.\r", end="")
+        #
+        #     block.log(f"Aligned {len(aligned_frame_pairs)} frame pairs.")
+        #
+        #     # # TODO: Fix out-of-memory issues with concatenating aligned frame pairs
+        #     # aligned_frame_pairs = np.array(aligned_frame_pairs, dtype=np.float32)
+        #     # np.save(aligned_frame_pairs_cache_path, aligned_frame_pairs)
+        #     with open(aligned_frame_pairs_cache_path, 'wb') as f:
+        #         pickle.dump(aligned_frame_pairs)
+        #
+        #     block.log(f"Saved aligned frame pairs to {aligned_frame_pairs_cache_path}.")
 
     with TimerBlock("Fine Tune Depth Estimation Model") as block:
         pass
 
-    with TimerBlock("Generate Depth Maps") as block:
+    with TimerBlock("Generate Refined Depth Maps") as block:
         pass
 
 

@@ -3,7 +3,5 @@
   <component name="VcsDirectoryMappings">
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/MiDaS" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/flownet2" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/flownet2/MiDaS" vcs="Git" />
   </component>
 </project>
