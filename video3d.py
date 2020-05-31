@@ -1,16 +1,19 @@
 import math
+import os
 from collections import defaultdict
-from typing import List, Tuple, DefaultDict, Optional
+from typing import List, Tuple, DefaultDict, Optional, Iterable, Collection, Container, Union
 
 import cv2
 import plac
 import numpy as np
 import torch
 from scipy.spatial.transform import Rotation
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torchvision.transforms import Compose
 
 from MiDaS.models.midas_net import MidasNet
 from MiDaS.models.transforms import Resize, NormalizeImage, PrepareForNet
+from align_images import align_images
 from utils.tools import TimerBlock
 
 
@@ -193,33 +196,67 @@ def sample_frame_pairs(num_frames):
     return frame_pairs
 
 
+class NumpyDataset(Dataset):
+    def __init__(self, arrays: List[np.ndarray], to_tensor_transform: Compose):
+        """Dataset wrapping numpy arrays.
+
+        Each sample will be retrieved by indexing tensors along the first dimension.
+
+        :param arrays: numpy arrays that all have the same shape.
+        :param to_tensor_transform: The transform that takes a numpy array and converts it to a torch Tensor object.
+        """
+        assert all(arrays[0].shape == tensor.shape for tensor in arrays)
+        self.arrays = arrays
+        self.to_tensor = to_tensor_transform
+
+    def __getitem__(self, index):
+        return self.to_tensor({"image": self.arrays[index]})
+
+    def __len__(self):
+        return len(self.arrays)
+
+
 @plac.annotations(
-    cameras_txt=plac.Annotation("The camera intrinsics txt file exported from COLMAP."),
-    images_txt=plac.Annotation("The image data txt file exported from COLMAP."),
-    points_3d_txt=plac.Annotation("The 3D points txt file exported from COLMAP."),
+    # cameras_txt=plac.Annotation("The camera intrinsics txt file exported from COLMAP."),
+    # images_txt=plac.Annotation("The image data txt file exported from COLMAP."),
+    # points_3d_txt=plac.Annotation("The 3D points txt file exported from COLMAP."),
+    colmap_output_path=plac.Annotation(
+        "The path to the folder containing the text files `cameras.txt`, `images.txt` and `points3D.txt`."),
     video_path=plac.Annotation('The path to the source video file.', type=str,
                                kind='option', abbrev='i'),
     model_path=plac.Annotation("The path to the pretrained MiDaS model weights.", type=str, kind="option", abbrev='m'),
 )
-def main(cameras_txt: str, images_txt: str, points_3d_txt: str, video_path: str, model_path: str = "model.pt"):
-    camera = parse_cameras(cameras_txt)[0]
-    poses_by_image, points2d_by_image = parse_images(images_txt)
-    points3d_by_id = parse_points(points_3d_txt)
+def main(colmap_output_path: str, video_path: str, model_path: str = "model.pt"):
+    with TimerBlock("Parse COLMAP Output") as block:
+        cameras_txt = os.path.join(colmap_output_path, "cameras.txt")
+        images_txt = os.path.join(colmap_output_path, "images.txt")
+        points_3d_txt = os.path.join(colmap_output_path, "points3D.txt")
 
-    depth_maps = []
+        camera = parse_cameras(cameras_txt)[0]
+        block.log("Parsed camera intrinsics.")
 
-    for points in points2d_by_image.values():
-        depth_map = np.zeros(shape=camera.shape)
+        poses_by_image, points2d_by_image = parse_images(images_txt)
+        block.log("Parsed camera poses and 2D points.")
 
-        for point in points:
-            if point.point3d_id > -1 and point.x <= depth_map.shape[1] and point.y <= depth_map.shape[0]:
-                point3d = points3d_by_id[point.point3d_id]
+        points3d_by_id = parse_points(points_3d_txt)
+        block.log("Parsed 3D points.")
 
-                depth_map[int(point.y), int(point.x)] = point3d.z
+        sparse_depth_maps = []
 
-        depth_maps.append(depth_map)
+        for points in points2d_by_image.values():
+            depth_map = np.zeros(shape=camera.shape)
 
-    relative_depth_scales = []
+            for point in points:
+                if point.point3d_id > -1 and point.x <= depth_map.shape[1] and point.y <= depth_map.shape[0]:
+                    point3d = points3d_by_id[point.point3d_id]
+
+                    depth_map[int(point.y), int(point.x)] = point3d.z
+
+            sparse_depth_maps.append(depth_map)
+
+        sparse_depth_maps = np.array(sparse_depth_maps)
+
+        block.log("Generated sparse depth maps for each frame.")
 
     with TimerBlock("Load Video and Depth Estimation Model") as block:
         input_video = cv2.VideoCapture(video_path)
@@ -230,9 +267,27 @@ def main(cameras_txt: str, images_txt: str, points_3d_txt: str, video_path: str,
 
         block.log(f"Opened video from path `{video_path}`.")
 
+        frames = []
+
+        while input_video.isOpened():
+            has_frame, frame = input_video.read()
+
+            if not has_frame:
+                break
+
+            frames.append(frame)
+
+        block.log("Extracted video frames.")
+
         width = int(input_video.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(input_video.get(cv2.CAP_PROP_FRAME_HEIGHT))
         block.log(f"Got video dimensions: {width}x{height}.")
+
+        num_frames = int(input_video.get(cv2.CAP_PROP_FRAME_COUNT))
+        block.log(f"Got number of frames: {num_frames}.")
+
+        if input_video.isOpened():
+            input_video.release()
 
         transform = Compose(
             [
@@ -252,61 +307,55 @@ def main(cameras_txt: str, images_txt: str, points_3d_txt: str, video_path: str,
 
         block.log("Created image transform.")
 
-        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        video_dataset = NumpyDataset(frames, transform)
+        block.log("Created dataset.")
 
         model = MidasNet(model_path, non_negative=True)
-        model.to(device)
+        model = model.cuda(0)
         model.load_state_dict(torch.load(model_path, map_location="cpu"))
         model.eval()
         block.log("Loaded depth estimation model.")
 
     with TimerBlock("Calculate Relative Depth Scaling Factor") as block:
-        while input_video.isOpened():
-            has_frame, frame = input_video.read()
+        relative_depth_scales = []
+        depth_maps = []
+        sequential_dataloader = DataLoader(video_dataset, batch_size=8, shuffle=False)
 
-            if not has_frame:
-                break
+        with torch.no_grad():
+            for batch in sequential_dataloader:
+                imgs = batch["image"]
+                imgs = imgs.cuda()
+                prediction = model(imgs)
+                depth_maps.append(prediction.cpu())
 
-            device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-            img_input = transform({"image": frame})["image"]
-
-            with torch.no_grad():
-                sample = torch.from_numpy(img_input).to(device).unsqueeze(0)
-                prediction = model.forward(sample)
-
-                output = torch.nn.functional.interpolate(prediction.unsqueeze(0), size=(width, height),
-                                                         mode='bilinear', align_corners=True)
-                output = output.squeeze().permute((1, 0))
-                output = output.cpu().numpy()
-
-                relative_scales = []
-                sparse_depth = depth_maps[frame_i]
-
-                for row in range(height):
-                    for col in range(width):
-                        if sparse_depth[row, col] != 0:
-                            relative_scales.append(output[row, col] / sparse_depth[row, col])
-
-                relative_depth_scales.append(np.median(relative_scales))
-
-            block.log(f"Frame {frame_i:02d}\r", end="")
-            frame_i += 1
+                frame_i += imgs.shape[0]
+                block.log(f"Frame {frame_i:02d}\r", end="")
 
         print()
-        block.log(f"Processed {frame_i} frames.")
+        block.log(f"Generated {len(depth_maps)} depth maps.")
+
+        stacked_depth_maps = torch.stack(depth_maps, dim=0)
+
+        depth_maps = torch.nn.functional.interpolate(stacked_depth_maps, size=(width, height),
+                                                     mode='bilinear', align_corners=True)
+        depth_maps = depth_maps.squeeze().permute((1, 0))
+        depth_maps = depth_maps.cpu().numpy()
 
         relative_depth_scale = np.mean(relative_depth_scales)
 
         block.log(f"Calculated relative depth scale factor: {relative_depth_scale:.2f}.")
 
     with TimerBlock("Sample Frame Pairs") as block:
-        num_frames = int(input_video.get(cv2.CAP_PROP_FRAME_COUNT))
-        frame_pairs = sample_frame_pairs(num_frames)
+        frame_pair_indexes = sample_frame_pairs(num_frames)
         block.log("Sampled frame pairs")
 
     with TimerBlock("Align Frame Pairs") as block:
-        pass
+        frame_pairs = []
+
+        for i, j in frame_pair_indexes:
+            frame_pairs.append((frames[i], align_images(frames[i], frames[j])))
+
+        block.log(f"Aligned {len(frame_pairs)} frame pairs.")
 
     with TimerBlock("Generate Dense Optical Flow") as block:
         pass
@@ -319,9 +368,6 @@ def main(cameras_txt: str, images_txt: str, points_3d_txt: str, video_path: str,
 
     with TimerBlock("Generate Depth Maps") as block:
         pass
-
-    if input_video.isOpened():
-        input_video.release()
 
 
 if __name__ == '__main__':
