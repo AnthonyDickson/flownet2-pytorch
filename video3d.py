@@ -2,19 +2,19 @@ import math
 import os
 import pickle
 from collections import defaultdict
-from typing import List, Tuple, DefaultDict, Optional, Iterable, Collection, Container, Union
+from typing import List, Tuple, DefaultDict, Optional
 
 import cv2
-import plac
 import numpy as np
+import plac
 import torch
 from scipy.spatial.transform import Rotation
-from torch.utils.data import DataLoader, Dataset, TensorDataset
+from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import Compose
 
 from MiDaS.models.midas_net import MidasNet
 from MiDaS.models.transforms import Resize, NormalizeImage, PrepareForNet
-from align_images import align_images
+from models import FlowNet2
 from utils.tools import TimerBlock
 
 
@@ -226,7 +226,7 @@ class NumpyDataset(Dataset):
 def generate_depth_maps(model, video_dataset, width, height, logger, dnn_depth_map_cache_path):
     try:
         depth_maps = np.load(dnn_depth_map_cache_path)
-        logger.log(f"Loaded DNN depth maps from {dnn_depth_map_cache_path}.")
+        logger.log("Loaded DNN depth maps from {}.".format(dnn_depth_map_cache_path))
     except IOError:
         depth_maps = []
         sequential_dataloader = DataLoader(video_dataset, batch_size=8, shuffle=False)
@@ -240,9 +240,9 @@ def generate_depth_maps(model, video_dataset, width, height, logger, dnn_depth_m
                 depth_maps.append(prediction.cpu())
 
                 frame_i += imgs.shape[0]
-                logger.log(f"Generated {frame_i:02d} frames.\r", end="")
+                logger.log("Generated {:02d} frames.\r".format(frame_i), end="")
 
-        logger.log(f"Generated {len(depth_maps)} depth maps.")
+        logger.log("Generated {} depth maps.".format(len(depth_maps)))
 
         depth_maps = torch.cat(depth_maps, dim=0)
         logger.log("Concatenated depth maps.")
@@ -254,17 +254,17 @@ def generate_depth_maps(model, video_dataset, width, height, logger, dnn_depth_m
 
         # Network produces output as NCWH - dropped channel since output is B&W and just need to change to NHW.
         depth_maps = depth_maps.squeeze().permute((0, 2, 1)).to(torch.float32).cpu().numpy()
-        logger.log(f"Resized depth maps back to {depth_maps.shape[-2:]} from {output_shape}.")
+        logger.log("Resized depth maps back to {} from {}.".format(depth_maps.shape[-2:], output_shape))
 
         np.save(dnn_depth_map_cache_path, depth_maps)
-        logger.log(f"Saved DNN depth maps to {dnn_depth_map_cache_path}.")
+        logger.log("Saved DNN depth maps to {}.".format(dnn_depth_map_cache_path))
     return depth_maps
 
 
 def generate_sparse_depth_maps(camera, points2d_by_image, points3d_by_id, logger, sparse_depth_map_cache_path):
     try:
         sparse_depth_maps = np.load(sparse_depth_map_cache_path)
-        logger.log(f"Loaded sparse depth maps from {sparse_depth_map_cache_path}.")
+        logger.log("Loaded sparse depth maps from {}.".format(sparse_depth_map_cache_path))
     except IOError:
         sparse_depth_maps = []
 
@@ -283,7 +283,7 @@ def generate_sparse_depth_maps(camera, points2d_by_image, points3d_by_id, logger
         logger.log("Generated sparse depth maps for each frame.")
 
         np.save(sparse_depth_map_cache_path, sparse_depth_maps)
-        logger.log(f"Saved sparse depth maps to {sparse_depth_map_cache_path}.")
+        logger.log("Saved sparse depth maps to {}.".format(sparse_depth_map_cache_path))
     return sparse_depth_maps
 
 
@@ -292,11 +292,15 @@ def generate_sparse_depth_maps(camera, points2d_by_image, points3d_by_id, logger
         "The path to the folder containing the text files `cameras.txt`, `images.txt` and `points3D.txt`."),
     video_path=plac.Annotation('The path to the source video file.', type=str,
                                kind='option', abbrev='i'),
-    model_path=plac.Annotation("The path to the pretrained MiDaS model weights.", type=str, kind="option", abbrev='m'),
+    depth_estimation_model_path=plac.Annotation("The path to the pretrained MiDaS model weights.", type=str,
+                                                kind="option", abbrev='d'),
+    optical_flow_model_path=plac.Annotation("The path to the pretrained FlowNet2 model weights.", type=str,
+                                            kind="option", abbrev='f'),
     cache_path=plac.Annotation("Where to save and load intermediate results to and from.", type=str, kind="option",
                                abbrev="c")
 )
-def main(colmap_output_path: str, video_path: str, model_path: str = "model.pt", cache_path: str = ".cache"):
+def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: str = "model.pt",
+         optical_flow_model_path: str = "FlowNet2_checkpoint.pth.tar", cache_path: str = ".cache"):
     cache_path = os.path.abspath(cache_path)
     video_name = os.path.basename(video_path)
     cache_path = os.path.join(cache_path, video_name)
@@ -311,7 +315,7 @@ def main(colmap_output_path: str, video_path: str, model_path: str = "model.pt",
             with open(colmap_cache_path, 'rb') as f:
                 camera, poses_by_image, points2d_by_image, points3d_by_id = pickle.load(f)
 
-            block.log(f"Loaded parsed COLMAP output from {colmap_cache_path}.")
+            block.log("Loaded parsed COLMAP output from {}.".format(colmap_cache_path))
         except FileNotFoundError:
             cameras_txt = os.path.join(colmap_output_path, "cameras.txt")
             images_txt = os.path.join(colmap_output_path, "images.txt")
@@ -332,15 +336,15 @@ def main(colmap_output_path: str, video_path: str, model_path: str = "model.pt",
             with open(colmap_cache_path, 'wb') as f:
                 pickle.dump((camera, poses_by_image, points2d_by_image, points3d_by_id), f)
 
-            block.log(f"Saved parsed COLMAP output to {colmap_cache_path}.")
+            block.log("Saved parsed COLMAP output to {}.".format(colmap_cache_path))
 
     with TimerBlock("Load Video") as block:
         input_video = cv2.VideoCapture(video_path)
 
         if not input_video.isOpened():
-            raise RuntimeError(f"Could not open video from the path {video_path}.")
+            raise RuntimeError("Could not open video from the path {}.".format(video_path))
 
-        block.log(f"Opened video from path the {video_path}.")
+        block.log("Opened video from path the {}.".format(video_path))
 
         frames = []
 
@@ -356,10 +360,10 @@ def main(colmap_output_path: str, video_path: str, model_path: str = "model.pt",
 
         width = int(input_video.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(input_video.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        block.log(f"Got video dimensions: {width}x{height}.")
+        block.log("Got video dimensions: {}x{}.".format(width, height))
 
         num_frames = int(input_video.get(cv2.CAP_PROP_FRAME_COUNT))
-        block.log(f"Got number of frames: {num_frames}.")
+        block.log("Got number of frames: {}.".format(num_frames))
 
         if input_video.isOpened():
             input_video.release()
@@ -386,9 +390,9 @@ def main(colmap_output_path: str, video_path: str, model_path: str = "model.pt",
         video_dataset = NumpyDataset(frames, transform)
         block.log("Created dataset.")
 
-        model = MidasNet(model_path, non_negative=True)
+        model = MidasNet(depth_estimation_model_path, non_negative=True)
         model = model.cuda(0)
-        model.load_state_dict(torch.load(model_path, map_location="cpu"))
+        model.load_state_dict(torch.load(depth_estimation_model_path, map_location="cpu"))
         model.eval()
         block.log("Loaded depth estimation model.")
 
@@ -396,7 +400,7 @@ def main(colmap_output_path: str, video_path: str, model_path: str = "model.pt",
             with open(relative_depth_scale_cache_path, 'rb') as f:
                 relative_depth_scale = pickle.load(f)
 
-            block.log(f"Loaded relative depth scale from {relative_depth_scale_cache_path}")
+            block.log("Loaded relative depth scale from {}".format(relative_depth_scale_cache_path))
         except FileNotFoundError:
             depth_maps = generate_depth_maps(model, video_dataset, width, height, block, dnn_depth_map_cache_path)
 
@@ -409,16 +413,29 @@ def main(colmap_output_path: str, video_path: str, model_path: str = "model.pt",
             relative_depth_scale[zero_mask] = np.nan
             relative_depth_scale = np.nanmedian(relative_depth_scale, axis=[1, 2])
             relative_depth_scale = np.mean(relative_depth_scale)
-            block.log(f"Calculated relative depth scale factor: {relative_depth_scale:.2f}.")
+            block.log("Calculated relative depth scale factor: {:.2f}.".format(relative_depth_scale))
 
             with open(relative_depth_scale_cache_path, 'wb') as f:
                 pickle.dump(relative_depth_scale, f)
 
-            block.log(f"Saved relative depth scale factor to {relative_depth_scale_cache_path}.")
+            block.log("Saved relative depth scale factor to {}.".format(relative_depth_scale_cache_path))
 
     with TimerBlock("Generate Dense Optical Flow") as block:
         frame_pair_indexes = sample_frame_pairs(num_frames)
         block.log("Sampled frame pairs")
+
+        # TODO: Make this less hacky...
+        # Simulate argparse object because I'm too lazy to implement it properly.
+        class Object(object):
+            pass
+
+        args = Object()
+        args.fp16 = True
+        args.rgb_max = 255
+
+        flow_net = FlowNet2(args).cuda()
+        flow_net.load_state_dict(torch.load(optical_flow_model_path)["state_dict"])
+        block.log("Loaded optical flow model from {}.".format(optical_flow_model_path))
 
         # try:
         #     aligned_frame_pairs = np.load(aligned_frame_pairs_cache_path)

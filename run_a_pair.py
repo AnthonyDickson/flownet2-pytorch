@@ -2,8 +2,8 @@ import torch
 import numpy as np
 import argparse
 
-from Networks.FlowNet2 import FlowNet2  # the path is depended on where you create this module
-from frame_utils import read_gen  # the path is depended on where you create this module
+from models import FlowNet2  # the path is depended on where you create this module
+from utils.frame_utils import read_gen  # the path is depended on where you create this module
 
 if __name__ == '__main__':
     # obtain the necessary args for construct the flownet framework
