@@ -418,6 +418,43 @@ class CustomResize(object):
         return sample
 
 
+class OpticalFlowDataset(Dataset):
+    def __init__(self, dataset_path: str, image_transform):
+
+        assert os.path.isdir(dataset_path), \
+            "The following dataset path could not be found or read: {}.".format(dataset_path)
+
+        self.base_path = dataset_path
+        self.frame_paths = dict()
+        self.optical_flow_paths = []
+
+        for filename in os.listdir(self.base_path):
+            frame_number, ext = filename.split(".")
+
+            if ext == "png":
+                self.frame_paths[int(frame_number)] = os.path.join(self.base_path, filename)
+            elif ext == "npy":
+                self.optical_flow_paths.append(os.path.join(self.base_path, filename))
+
+        self._length = len(self.optical_flow_paths)
+        self.image_transform = image_transform
+
+    def __getitem__(self, index):
+        with open(self.optical_flow_paths[index], 'rb') as f:
+            i, j, optical_flow, valid_mask = pickle.load(f)
+
+        frame_i = np.load(self.frame_paths[i])
+        frame_i = self.image_transform({"image": frame_i})["image"]
+
+        frame_j = np.load(self.frame_paths[j])
+        frame_j = self.image_transform({"image": frame_j})["image"]
+
+        return frame_i, frame_j, optical_flow, valid_mask
+
+    def __len__(self):
+        return self._length
+
+
 @plac.annotations(
     colmap_output_path=plac.Annotation(
         "The path to the folder containing the text files `cameras.txt`, `images.txt` and `points3D.txt`."),
@@ -552,7 +589,11 @@ def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: 
 
             block.log("Saved relative depth scale factor to {}.".format(relative_depth_scale_cache_path))
 
-        # TODO: Transform camera poses (translation only) by scale factor.
+        for pose in poses_by_image.values():
+            pose.t = relative_depth_scale * pose.t
+
+        block.log("Scaled the translation component of the camera poses by the relative scale factor of {:.2f}"
+                  .format(relative_depth_scale))
 
     with TimerBlock("Create Optical Flow Dataset") as block:
         frame_pair_indexes = sample_frame_pairs(num_frames)
@@ -621,7 +662,7 @@ def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: 
                                 cv2.imwrite(os.path.join(dataset_cache_path, frame_filename), frames[frame_index])
                                 saved_frame_indexes.add(frame_index)
 
-                        sample_filename = "{:04d}-{:04d}.npy".format(i, j)
+                        sample_filename = "{:04d}-{:04d}.pkl".format(i, j)
                         sample_path = os.path.join(dataset_cache_path, sample_filename)
 
                         with open(sample_path, 'wb') as f:
@@ -638,11 +679,26 @@ def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: 
         else:
             block.log("Found dataset at {}.".format(dataset_cache_path))
 
-        # TODO: Create PyTorch dataset from original frame pairs and optical flow field.
-        # flow_dataset = OpticalFlowDataset(dataset_cache_path)
+        transform = Compose(
+            [
+                Resize(
+                    width,
+                    height,
+                    resize_target=None,
+                    keep_aspect_ratio=True,
+                    ensure_multiple_of=32,
+                    resize_method="upper_bound",
+                    image_interpolation_method=cv2.INTER_CUBIC,
+                ),
+                NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                PrepareForNet(),
+            ]
+        )
+        flow_dataset = OpticalFlowDataset(dataset_cache_path, transform)
+        block.log("Created optical flow dataset.")
 
     with TimerBlock("Fine Tune Depth Estimation Model") as block:
-        # TODO: Create dataloader for flow dataset
+        data_loader = DataLoader(flow_dataset, batch_size=8)
         # TODO: Define loss functions
         # TODO: Optimise depth estimation network
         # TODO: Save optimised depth estimation network weights
