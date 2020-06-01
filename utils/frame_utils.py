@@ -1,12 +1,14 @@
 import numpy as np
 from os.path import *
-from scipy.misc import imread
+from PIL import Image
 from . import flow_utils 
 
 def read_gen(file_name):
     ext = splitext(file_name)[-1]
     if ext == '.png' or ext == '.jpeg' or ext == '.ppm' or ext == '.jpg':
-        im = imread(file_name)
+        im = Image.open(file_name)
+        im = np.asarray(im)
+
         if im.shape[2] > 3:
             return im[:,:,:3]
         else:

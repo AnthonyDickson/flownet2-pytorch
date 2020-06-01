@@ -22,6 +22,7 @@ ENV LIBRARY_PATH /usr/local/nvidia/lib64:/usr/local/nvidia/lib:/usr/local/cuda/l
 # python3 modules
 RUN wget https://bootstrap.pypa.io/get-pip.py && python3 get-pip.py && \
         pip3 install --upgrade --no-cache-dir wheel six setuptools cython numpy scipy==1.4.1 \
-        matplotlib seaborn scikit-learn scikit-image pillow requests opencv-python plac \
+        matplotlib seaborn scikit-learn scikit-image pillow requests plac \
+        opencv-python==3.4.2.17 opencv-contrib-python==3.4.2.17 \
         jupyterlab networkx h5py pandas plotly protobuf tqdm tensorboardX colorama setproctitle && \
         pip install torch==1.1.0 torchvision==0.3.0 -f https://download.pytorch.org/whl/cu90/torch_stable.html

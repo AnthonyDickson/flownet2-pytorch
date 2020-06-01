@@ -5,6 +5,7 @@ from collections import defaultdict
 from typing import List, Tuple, DefaultDict, Optional
 
 import cv2
+import matplotlib.pyplot as plt
 import numpy as np
 import plac
 import torch
@@ -14,7 +15,9 @@ from torchvision.transforms import Compose
 
 from MiDaS.models.midas_net import MidasNet
 from MiDaS.models.transforms import Resize, NormalizeImage, PrepareForNet
+from align_images import align_images
 from models import FlowNet2
+from utils.flow_utils import flow2img
 from utils.tools import TimerBlock
 
 
@@ -287,6 +290,134 @@ def generate_sparse_depth_maps(camera, points2d_by_image, points3d_by_id, logger
     return sparse_depth_maps
 
 
+class CustomResize(object):
+    """Resize sample to given size (width, height)."""
+
+    def __init__(
+            self,
+            width,
+            height,
+            resize_target=True,
+            keep_aspect_ratio=False,
+            ensure_multiple_of=1,
+            resize_method="lower_bound",
+            image_interpolation_method=cv2.INTER_AREA,
+    ):
+        """Init.
+
+        Args:
+            width (int): desired output width
+            height (int): desired output height
+            resize_target (bool, optional):
+                True: Resize the full sample (image, mask, target).
+                False: Resize image only.
+                Defaults to True.
+            keep_aspect_ratio (bool, optional):
+                True: Keep the aspect ratio of the input sample.
+                Output sample might not have the given width and height, and
+                resize behaviour depends on the parameter 'resize_method'.
+                Defaults to False.
+            ensure_multiple_of (int, optional):
+                Output width and height is constrained to be multiple of this parameter.
+                Defaults to 1.
+            resize_method (str, optional):
+                "lower_bound": Output will be at least as large as the given size.
+                "upper_bound": Output will be at max as large as the given size. (Output size might be smaller than given size.)
+                "minimal": Scale as least as possible.  (Output size might be smaller than given size.)
+                Defaults to "lower_bound".
+        """
+        self.__width = width
+        self.__height = height
+
+        self.__resize_target = resize_target
+        self.__keep_aspect_ratio = keep_aspect_ratio
+        self.__multiple_of = ensure_multiple_of
+        self.__resize_method = resize_method
+        self.__image_interpolation_method = image_interpolation_method
+
+    def constrain_to_multiple_of(self, x, min_val=0, max_val=None):
+        y = (np.round(x / self.__multiple_of) * self.__multiple_of).astype(int)
+
+        if max_val is not None and y > max_val:
+            y = (np.floor(x / self.__multiple_of) * self.__multiple_of).astype(int)
+
+        if y < min_val:
+            y = (np.ceil(x / self.__multiple_of) * self.__multiple_of).astype(int)
+
+        return y
+
+    def get_size(self, width, height):
+        # determine new height and width
+        scale_height = self.__height / height
+        scale_width = self.__width / width
+
+        if self.__keep_aspect_ratio:
+            if self.__resize_method == "lower_bound":
+                # scale such that output size is lower bound
+                if scale_width > scale_height:
+                    # fit width
+                    scale_height = scale_width
+                else:
+                    # fit height
+                    scale_width = scale_height
+            elif self.__resize_method == "upper_bound":
+                # scale such that output size is upper bound
+                if scale_width < scale_height:
+                    # fit width
+                    scale_height = scale_width
+                else:
+                    # fit height
+                    scale_width = scale_height
+            elif self.__resize_method == "minimal":
+                # scale as least as possbile
+                if abs(1 - scale_width) < abs(1 - scale_height):
+                    # fit width
+                    scale_height = scale_width
+                else:
+                    # fit height
+                    scale_width = scale_height
+            else:
+                raise ValueError(
+                    "resize_method {} not implemented".format(self.__resize_method)
+                )
+
+        if self.__resize_method == "lower_bound":
+            new_height = self.constrain_to_multiple_of(
+                scale_height * height, min_val=self.__height
+            )
+            new_width = self.constrain_to_multiple_of(
+                scale_width * width, min_val=self.__width
+            )
+        elif self.__resize_method == "upper_bound":
+            new_height = self.constrain_to_multiple_of(
+                scale_height * height, max_val=self.__height
+            )
+            new_width = self.constrain_to_multiple_of(
+                scale_width * width, max_val=self.__width
+            )
+        elif self.__resize_method == "minimal":
+            new_height = self.constrain_to_multiple_of(scale_height * height)
+            new_width = self.constrain_to_multiple_of(scale_width * width)
+        else:
+            raise ValueError("resize_method {} not implemented".format(self.__resize_method))
+
+        return (new_width, new_height)
+
+    def __call__(self, sample):
+        width, height = self.get_size(
+            sample.shape[1], sample.shape[0]
+        )
+
+        # resize sample
+        sample = cv2.resize(
+            sample,
+            (width, height),
+            interpolation=self.__image_interpolation_method,
+        )
+
+        return sample
+
+
 @plac.annotations(
     colmap_output_path=plac.Annotation(
         "The path to the folder containing the text files `cameras.txt`, `images.txt` and `points3D.txt`."),
@@ -301,6 +432,7 @@ def generate_sparse_depth_maps(camera, points2d_by_image, points3d_by_id, logger
 )
 def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: str = "model.pt",
          optical_flow_model_path: str = "FlowNet2_checkpoint.pth.tar", cache_path: str = ".cache"):
+    # TODO: Refactor caching stuff into own class?
     cache_path = os.path.abspath(cache_path)
     video_name = os.path.basename(video_path)
     cache_path = os.path.join(cache_path, video_name)
@@ -308,7 +440,7 @@ def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: 
     sparse_depth_map_cache_path = os.path.join(cache_path, "sparse_depth_map.npy")
     dnn_depth_map_cache_path = os.path.join(cache_path, "dnn_depth_map.npy")
     relative_depth_scale_cache_path = os.path.join(cache_path, "relative_depth_scale.pkl")
-    # aligned_frame_pairs_cache_path = os.path.join(cache_path, "aligned_frame_pairs.npy")
+    dataset_cache_path = os.path.join(cache_path, "dataset")
 
     with TimerBlock("Parse COLMAP Output") as block:
         try:
@@ -420,7 +552,9 @@ def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: 
 
             block.log("Saved relative depth scale factor to {}.".format(relative_depth_scale_cache_path))
 
-    with TimerBlock("Generate Dense Optical Flow") as block:
+        # TODO: Transform camera poses (translation only) by scale factor.
+
+    with TimerBlock("Create Optical Flow Dataset") as block:
         frame_pair_indexes = sample_frame_pairs(num_frames)
         block.log("Sampled frame pairs")
 
@@ -430,38 +564,92 @@ def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: 
             pass
 
         args = Object()
-        args.fp16 = True
+        args.fp16 = False
         args.rgb_max = 255
+
+        t = CustomResize(
+            width,
+            height,
+            resize_target=None,
+            keep_aspect_ratio=True,
+            ensure_multiple_of=64,
+            resize_method="upper_bound",
+            image_interpolation_method=cv2.INTER_CUBIC,
+        )
 
         flow_net = FlowNet2(args).cuda()
         flow_net.load_state_dict(torch.load(optical_flow_model_path)["state_dict"])
         block.log("Loaded optical flow model from {}.".format(optical_flow_model_path))
 
-        # try:
-        #     aligned_frame_pairs = np.load(aligned_frame_pairs_cache_path)
-        #     block.log(f"Loaded aligned frame pairs from {aligned_frame_pairs_cache_path}.")
-        # except IOError:
-        #     aligned_frame_pairs = []
-        #
-        #     for pair_index, (i, j) in enumerate(frame_pair_indexes):
-        #         aligned_frame = align_images(frames[i], frames[j])
-        #         aligned_frame_pairs.append((pair_index, aligned_frame.astype(np.float32)))
-        #         block.log(f"Aligned {pair_index + 1} out of {len(frame_pair_indexes)} frame pairs.\r", end="")
-        #
-        #     block.log(f"Aligned {len(aligned_frame_pairs)} frame pairs.")
-        #
-        #     # # TODO: Fix out-of-memory issues with concatenating aligned frame pairs
-        #     # aligned_frame_pairs = np.array(aligned_frame_pairs, dtype=np.float32)
-        #     # np.save(aligned_frame_pairs_cache_path, aligned_frame_pairs)
-        #     with open(aligned_frame_pairs_cache_path, 'wb') as f:
-        #         pickle.dump(aligned_frame_pairs)
-        #
-        #     block.log(f"Saved aligned frame pairs to {aligned_frame_pairs_cache_path}.")
+        if not os.path.isdir(dataset_cache_path):
+            os.makedirs(dataset_cache_path)
+
+            num_filtered = 0
+            saved_frame_indexes = set()
+
+            def calculate_optical_flow(frame_i, frame_j):
+                images = list(map(t, (frame_i, frame_j)))
+                images = np.array(images).transpose(3, 0, 1, 2)
+                images_tensor = torch.from_numpy(images.astype(np.float32)).unsqueeze(0).cuda()
+
+                optical_flow = flow_net(images_tensor)
+                optical_flow = torch.nn.functional.interpolate(optical_flow, size=(height, width),
+                                                               mode='bilinear', align_corners=True)
+                optical_flow = optical_flow.squeeze().permute((1, 2, 0)).cpu().numpy()
+
+                return optical_flow
+
+            with torch.no_grad():
+                for pair_index, (i, j) in enumerate(frame_pair_indexes):
+                    frame_i = frames[i]
+                    frame_j = frames[j]
+                    frame_j_aligned = align_images(frame_i, frame_j)
+
+                    optical_flow_forwards = calculate_optical_flow(frame_i, frame_j_aligned)
+
+                    optical_flow_backwards = calculate_optical_flow(align_images(frames[j], frames[i]), frames[j])
+
+                    delta = np.abs(optical_flow_forwards - optical_flow_backwards)
+                    valid_mask = (delta <= 1).astype(np.bool)
+                    should_keep_frame = np.mean(valid_mask) >= 0.8
+
+                    if should_keep_frame:
+                        for frame_index in (i, j):
+                            if frame_index not in saved_frame_indexes:
+                                frame_filename = "{:04d}.png".format(frame_index)
+
+                                cv2.imwrite(os.path.join(dataset_cache_path, frame_filename), frames[frame_index])
+                                saved_frame_indexes.add(frame_index)
+
+                        sample_filename = "{:04d}-{:04d}.npy".format(i, j)
+                        sample_path = os.path.join(dataset_cache_path, sample_filename)
+
+                        with open(sample_path, 'wb') as f:
+                            pickle.dump((i, j, optical_flow_forwards, valid_mask), f)
+                    else:
+                        num_filtered += 1
+
+                    block.log("Processed {} frame pairs out of {} ({} kept, {} filtered out).\r"
+                              .format(pair_index + 1, len(frame_pair_indexes), pair_index + 1 - num_filtered,
+                                      num_filtered), end="")
+
+            print()
+            block.log("Saved dataset to {}.".format(dataset_cache_path))
+        else:
+            block.log("Found dataset at {}.".format(dataset_cache_path))
+
+        # TODO: Create PyTorch dataset from original frame pairs and optical flow field.
+        # flow_dataset = OpticalFlowDataset(dataset_cache_path)
 
     with TimerBlock("Fine Tune Depth Estimation Model") as block:
+        # TODO: Create dataloader for flow dataset
+        # TODO: Define loss functions
+        # TODO: Optimise depth estimation network
+        # TODO: Save optimised depth estimation network weights
         pass
 
     with TimerBlock("Generate Refined Depth Maps") as block:
+        # TODO: Generate depth maps for each frame.
         pass
 
 
