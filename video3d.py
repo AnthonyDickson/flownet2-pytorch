@@ -595,6 +595,10 @@ def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: 
         block.log("Scaled the translation component of the camera poses by the relative scale factor of {:.2f}"
                   .format(relative_depth_scale))
 
+        del depth_maps
+        del sparse_depth_maps
+        block.log("Freed memory used by depth maps.")
+
     with TimerBlock("Create Optical Flow Dataset") as block:
         frame_pair_indexes = sample_frame_pairs(num_frames)
         block.log("Sampled frame pairs")
@@ -699,10 +703,49 @@ def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: 
 
     with TimerBlock("Fine Tune Depth Estimation Model") as block:
         data_loader = DataLoader(flow_dataset, batch_size=8)
-        # TODO: Define loss functions
+        block.log("Created data loader for optical flow dataset.")
+
+        K = camera.get_matrix()
+        K_inverse = np.linalg.inv(K)
+
+        def flow_displaced_point(x, optical_flow_field):
+            return np.array(x + optical_flow_field[x], dtype=np.int)
+
+        def point2d_to_homogeneous_point3d(x):
+            return np.array([*x, 1.0, 1.0])
+
+        def point2d_to_point3d(x, depth, K_inv):
+            return depth * np.matmul(K_inv, point2d_to_homogeneous_point3d(x))
+
+        def projected_point3d(x, i, j, K_inv):
+            c_i = point2d_to_point3d(x, depth_maps[i][x], K_inv)
+            R_i, t_i = poses_by_image[i].R, poses_by_image[i].t
+            R_j, t_j = poses_by_image[j].R, poses_by_image[j].t
+
+            return R_j.as_matrix() * (R_i.as_matrix() * c_i + point2d_to_homogeneous_point3d(t_i) - point2d_to_homogeneous_point3d(t_j))
+
+        def homogeneous_point3d_to_point2d(c):
+            x, y, z, _ = c
+            return np.array([[x / z, y / z]]).T
+
+        def frame_j_pos(c, K):
+            return homogeneous_point3d_to_point2d(K * c)
+
+        def spatial_loss(p, f):
+            return torch.dist(p, f)
+
+        def disparity_loss(x, z_i, z_ij, camera, optical_flow_field):
+            return camera.focal_length * torch.abs(1.0 / z_i[x] - 1.0 / z_ij[flow_displaced_point(x, optical_flow_field)])
+
+        def loss_func(x, i, j, valid_mask, K, K_inv, optical_flow_field, balancing_coefficient=0.1):
+            c = projected_point3d(x, i, j, K_inv)
+            p = frame_j_pos(c, K)
+            loss_terms = spatial_loss(p, f) * balancing_coefficient * disparity_loss(x, c[2], p[2], camera, optical_flow_field)
+            return 1 / valid_mask.sum() * torch.sum(loss_terms[valid_mask])
+
+        block.log("Created loss function.")
         # TODO: Optimise depth estimation network
         # TODO: Save optimised depth estimation network weights
-        pass
 
     with TimerBlock("Generate Refined Depth Maps") as block:
         # TODO: Generate depth maps for each frame.
