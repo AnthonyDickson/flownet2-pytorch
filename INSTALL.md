@@ -17,7 +17,7 @@
 
 # Ubuntu 20.04
 There were issues installing nvidia-docker on the latest version of Ubuntu. 
-It appears some drivers were not available.
+It appears some drivers were not available at the time of writing.
 
 # Windows
 The latest version of Docker (19.03) does not seem to support GPU on Windows yet.

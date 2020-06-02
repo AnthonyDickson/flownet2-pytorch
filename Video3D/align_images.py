@@ -2,8 +2,6 @@ from typing import Optional
 
 import matplotlib.pyplot as plt
 import cv2
-from tkinter import Tk
-from tkinter.filedialog import askopenfilename
 
 import numpy as np
 import plac
@@ -64,14 +62,6 @@ def main(query_img_path: Optional[str] = None, train_img_path: Optional[str] = N
     :param query_img_path: The path to the first image.
     :param train_img_path: The path to the second image.
     """
-    if query_img_path is None:
-        Tk().withdraw()  # we don't want a full GUI, so keep the root window from appearing
-        query_img_path = askopenfilename(title="Select Query Image")
-
-    if train_img_path is None:
-        Tk().withdraw()
-        train_img_path = askopenfilename(title="Select Train Image")
-
     query_img = cv2.imread(query_img_path, cv2.IMREAD_UNCHANGED)
     train_img = cv2.imread(train_img_path, cv2.IMREAD_UNCHANGED)
 

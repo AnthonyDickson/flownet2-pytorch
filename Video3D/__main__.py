@@ -1,198 +1,25 @@
 import math
 import os
 import pickle
-from collections import defaultdict
-from typing import List, Tuple, DefaultDict, Optional
+from typing import List
 
 import cv2
-import matplotlib.pyplot as plt
 import numpy as np
 import plac
 import torch
-from scipy.spatial.transform import Rotation
 from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import Compose
 
+import sys
+sys.path.insert(0, '..')
+
 from MiDaS.models.midas_net import MidasNet
 from MiDaS.models.transforms import Resize, NormalizeImage, PrepareForNet
-from align_images import align_images
+from Video3D.align_images import align_images
+from Video3D.colmap_parsing import parse_cameras, parse_images, parse_points
+from Video3D.dataset import OpticalFlowDatasetBuilder
 from models import FlowNet2
-from utils.flow_utils import flow2img
 from utils.tools import TimerBlock
-
-
-class Camera:
-    def __init__(self, width, height, focal_length, center_x, center_y, skew):
-        self.width = int(width)
-        self.height = int(height)
-        self.focal_length = float(focal_length)
-        self.center_x = int(center_x)
-        self.center_y = int(center_y)
-        self.skew = float(skew)
-
-    @property
-    def shape(self):
-        return self.height, self.width
-
-    def get_matrix(self):
-        return np.array([
-            [self.focal_length, self.skew, self.center_x, 0.0],
-            [0.0, self.focal_length, self.center_y, 0.0],
-            [0.0, 0.0, 1.0, 0.0]
-        ])
-
-    @staticmethod
-    def parse_line(line: str) -> 'Camera':
-        parts = line.split()
-        parts = map(float, parts[2:])
-        width, height, focal_length, center_x, center_y, skew = list(parts)
-
-        return Camera(width, height, focal_length, center_x, center_y, skew)
-
-
-def parse_cameras(txt_file):
-    cameras = []
-
-    with open(txt_file, 'r') as f:
-        for line in f:
-            if line[0] == "#":
-                continue
-
-            camera = Camera.parse_line(line)
-            cameras.append(camera)
-
-    return cameras
-
-
-class CameraPose:
-    def __init__(self, R=Rotation.identity(), t=np.zeros(shape=(3, 1))):
-        self.R = R
-        self.t = t
-
-    @staticmethod
-    def parse_COLMAP_txt(line: str):
-        line_parts = line.split()
-        line_parts = map(float, line_parts[1:-2])
-        qw, qx, qy, qz, tx, ty, tz = tuple(line_parts)
-
-        R = Rotation.from_quat([qx, qy, qz, qw])
-        t = np.array([[tx, ty, tz]]).T
-
-        return CameraPose(R, t)
-
-
-class Point2D:
-    def __init__(self, x: float, y: float, point3d_id: int):
-        self.x = x
-        self.y = y
-        self.point3d_id = point3d_id
-
-    @staticmethod
-    def parse_line(line: str) -> List['Point2D']:
-        parts = line.split()
-        points = []
-
-        for i in range(0, len(parts), 3):
-            x = float(parts[i])
-            y = float(parts[i + 1])
-            point3d_id = int(parts[i + 2])
-
-            points.append(Point2D(x, y, point3d_id))
-
-        return points
-
-
-def parse_images(txt_file) -> Tuple[DefaultDict[int, Optional[CameraPose]], DefaultDict[int, List[Point2D]]]:
-    poses = defaultdict(Camera)
-    points = defaultdict(list)
-
-    with open(txt_file, 'r') as f:
-        while True:
-            line1 = f.readline()
-
-            if line1 and line1[0] == "#":
-                continue
-
-            line2 = f.readline()
-
-            if not line1 or not line2:
-                break
-
-            image_id = int(line1.split()[0])
-
-            pose = CameraPose.parse_COLMAP_txt(line1)
-            points_in_image = Point2D.parse_line(line2)
-
-            poses[image_id] = pose
-            points[image_id] = points_in_image
-
-    return poses, points
-
-
-class Track:
-    def __init__(self, image_id: int, point2d_index: int):
-        self.image_id = int(image_id)
-        self.point2d_index = int(point2d_index)
-
-    @staticmethod
-    def parse_line(line: str) -> List['Track']:
-        parts = line.split()
-
-        return Track.parse_strings(parts)
-
-    @staticmethod
-    def parse_strings(parts: List[str]) -> List['Track']:
-        tracks = []
-
-        for i in range(0, len(parts), 2):
-            image_id = int(parts[i])
-            point2d_index = int(parts[i + 1])
-
-            tracks.append(Track(image_id, point2d_index))
-
-        return tracks
-
-
-class Point3D:
-    def __init__(self, point3d_id: int = -1,
-                 x: float = 0.0, y: float = 0.0, z: float = 0.0,
-                 r: int = 0, g: int = 0, b: int = 0,
-                 error: float = float('nan'), track=None):
-        if track is None:
-            track = []
-
-        self.point3d_id = int(point3d_id)
-        self.x = float(x)
-        self.y = float(y)
-        self.z = float(z)
-        self.r = int(r)
-        self.g = int(g)
-        self.b = int(b)
-        self.error = error
-        self.track = track
-
-    @staticmethod
-    def parse_line(line: str) -> 'Point3D':
-        parts = line.split()
-
-        point3d_id, x, y, z, r, g, b, error = parts[:8]
-        track = parts[8:]
-
-        return Point3D(point3d_id, x, y, z, r, g, b, error, Track.parse_strings(track))
-
-
-def parse_points(txt_file) -> DefaultDict[int, Optional[Point3D]]:
-    points = defaultdict(Point3D)
-
-    with open(txt_file, 'r') as f:
-        for line in f:
-            if line[0] == "#":
-                continue
-
-            point = Point3D.parse_line(line)
-            points[point.point3d_id] = point
-
-    return points
 
 
 def sample_frame_pairs(num_frames):
@@ -226,11 +53,38 @@ class NumpyDataset(Dataset):
 
 
 # TODO: Add flag for clearing cache.
-def generate_depth_maps(model, video_dataset, width, height, logger, dnn_depth_map_cache_path):
+def generate_depth_maps(depth_estimation_model_path, frames, width, height, logger, dnn_depth_map_cache_path):
     try:
         depth_maps = np.load(dnn_depth_map_cache_path)
         logger.log("Loaded DNN depth maps from {}.".format(dnn_depth_map_cache_path))
     except IOError:
+        transform = Compose(
+            [
+                Resize(
+                    width,
+                    height,
+                    resize_target=None,
+                    keep_aspect_ratio=True,
+                    ensure_multiple_of=32,
+                    resize_method="upper_bound",
+                    image_interpolation_method=cv2.INTER_CUBIC,
+                ),
+                NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                PrepareForNet(),
+            ]
+        )
+
+        logger.log("Created image transform.")
+
+        video_dataset = NumpyDataset(frames, transform)
+        logger.log("Created dataset.")
+
+        model = MidasNet(depth_estimation_model_path, non_negative=True)
+        model = model.cuda(0)
+        model.load_state_dict(torch.load(depth_estimation_model_path, map_location="cpu"))
+        model.eval()
+        logger.log("Loaded depth estimation model.")
+
         depth_maps = []
         sequential_dataloader = DataLoader(video_dataset, batch_size=8, shuffle=False)
         frame_i = 0
@@ -261,6 +115,7 @@ def generate_depth_maps(model, video_dataset, width, height, logger, dnn_depth_m
 
         np.save(dnn_depth_map_cache_path, depth_maps)
         logger.log("Saved DNN depth maps to {}.".format(dnn_depth_map_cache_path))
+
     return depth_maps
 
 
@@ -418,43 +273,6 @@ class CustomResize(object):
         return sample
 
 
-class OpticalFlowDataset(Dataset):
-    def __init__(self, dataset_path: str, image_transform):
-
-        assert os.path.isdir(dataset_path), \
-            "The following dataset path could not be found or read: {}.".format(dataset_path)
-
-        self.base_path = dataset_path
-        self.frame_paths = dict()
-        self.optical_flow_paths = []
-
-        for filename in os.listdir(self.base_path):
-            frame_number, ext = filename.split(".")
-
-            if ext == "png":
-                self.frame_paths[int(frame_number)] = os.path.join(self.base_path, filename)
-            elif ext == "npy":
-                self.optical_flow_paths.append(os.path.join(self.base_path, filename))
-
-        self._length = len(self.optical_flow_paths)
-        self.image_transform = image_transform
-
-    def __getitem__(self, index):
-        with open(self.optical_flow_paths[index], 'rb') as f:
-            i, j, optical_flow, valid_mask = pickle.load(f)
-
-        frame_i = np.load(self.frame_paths[i])
-        frame_i = self.image_transform({"image": frame_i})["image"]
-
-        frame_j = np.load(self.frame_paths[j])
-        frame_j = self.image_transform({"image": frame_j})["image"]
-
-        return frame_i, frame_j, optical_flow, valid_mask
-
-    def __len__(self):
-        return self._length
-
-
 @plac.annotations(
     colmap_output_path=plac.Annotation(
         "The path to the folder containing the text files `cameras.txt`, `images.txt` and `points3D.txt`."),
@@ -538,40 +356,14 @@ def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: 
             input_video.release()
 
     with TimerBlock("Calculate Relative Depth Scaling Factor") as block:
-        transform = Compose(
-            [
-                Resize(
-                    width,
-                    height,
-                    resize_target=None,
-                    keep_aspect_ratio=True,
-                    ensure_multiple_of=32,
-                    resize_method="upper_bound",
-                    image_interpolation_method=cv2.INTER_CUBIC,
-                ),
-                NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                PrepareForNet(),
-            ]
-        )
-
-        block.log("Created image transform.")
-
-        video_dataset = NumpyDataset(frames, transform)
-        block.log("Created dataset.")
-
-        model = MidasNet(depth_estimation_model_path, non_negative=True)
-        model = model.cuda(0)
-        model.load_state_dict(torch.load(depth_estimation_model_path, map_location="cpu"))
-        model.eval()
-        block.log("Loaded depth estimation model.")
-
         try:
             with open(relative_depth_scale_cache_path, 'rb') as f:
                 relative_depth_scale = pickle.load(f)
 
             block.log("Loaded relative depth scale from {}".format(relative_depth_scale_cache_path))
         except FileNotFoundError:
-            depth_maps = generate_depth_maps(model, video_dataset, width, height, block, dnn_depth_map_cache_path)
+            depth_maps = generate_depth_maps(depth_estimation_model_path, frames, width, height, block,
+                                             dnn_depth_map_cache_path)
 
             sparse_depth_maps = generate_sparse_depth_maps(camera, points2d_by_image, points3d_by_id, block,
                                                            sparse_depth_map_cache_path)
@@ -584,6 +376,10 @@ def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: 
             relative_depth_scale = np.mean(relative_depth_scale)
             block.log("Calculated relative depth scale factor: {:.2f}.".format(relative_depth_scale))
 
+            del depth_maps
+            del sparse_depth_maps
+            block.log("Freed memory used by depth maps.")
+
             with open(relative_depth_scale_cache_path, 'wb') as f:
                 pickle.dump(relative_depth_scale, f)
 
@@ -594,10 +390,6 @@ def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: 
 
         block.log("Scaled the translation component of the camera poses by the relative scale factor of {:.2f}"
                   .format(relative_depth_scale))
-
-        del depth_maps
-        del sparse_depth_maps
-        block.log("Freed memory used by depth maps.")
 
     with TimerBlock("Create Optical Flow Dataset") as block:
         frame_pair_indexes = sample_frame_pairs(num_frames)
@@ -630,7 +422,6 @@ def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: 
             os.makedirs(dataset_cache_path)
 
             num_filtered = 0
-            saved_frame_indexes = set()
 
             def calculate_optical_flow(frame_i, frame_j):
                 images = list(map(t, (frame_i, frame_j)))
@@ -644,7 +435,7 @@ def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: 
 
                 return optical_flow
 
-            with torch.no_grad():
+            with torch.no_grad(), OpticalFlowDatasetBuilder(dataset_cache_path, camera) as dataset_builder:
                 for pair_index, (i, j) in enumerate(frame_pair_indexes):
                     frame_i = frames[i]
                     frame_j = frames[j]
@@ -656,21 +447,17 @@ def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: 
 
                     delta = np.abs(optical_flow_forwards - optical_flow_backwards)
                     valid_mask = (delta <= 1).astype(np.bool)
+                    # `valid_mask` is up to this point, indicating if each of the u and v components of each optical
+                    # flow vector are within 1px error.
+                    # However, we need it to indicate this on a per-pixel basis, so we combine the binary maps of the u
+                    # and v components to give us the validity of the optical flow at the given pixel.
+                    valid_mask = valid_mask[:, :, 0] & valid_mask[:, :, 1]
+
+                    # TODO: Check if `delta = np.sum(np.abs(a - b), axis=-1) <= 1` would do the same thing as above.
                     should_keep_frame = np.mean(valid_mask) >= 0.8
 
                     if should_keep_frame:
-                        for frame_index in (i, j):
-                            if frame_index not in saved_frame_indexes:
-                                frame_filename = "{:04d}.png".format(frame_index)
-
-                                cv2.imwrite(os.path.join(dataset_cache_path, frame_filename), frames[frame_index])
-                                saved_frame_indexes.add(frame_index)
-
-                        sample_filename = "{:04d}-{:04d}.pkl".format(i, j)
-                        sample_path = os.path.join(dataset_cache_path, sample_filename)
-
-                        with open(sample_path, 'wb') as f:
-                            pickle.dump((i, j, optical_flow_forwards, valid_mask), f)
+                        dataset_builder.add(i, j, frame_i, frame_j, optical_flow_forwards, valid_mask, poses_by_image)
                     else:
                         num_filtered += 1
 
@@ -683,69 +470,13 @@ def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: 
         else:
             block.log("Found dataset at {}.".format(dataset_cache_path))
 
-        transform = Compose(
-            [
-                Resize(
-                    width,
-                    height,
-                    resize_target=None,
-                    keep_aspect_ratio=True,
-                    ensure_multiple_of=32,
-                    resize_method="upper_bound",
-                    image_interpolation_method=cv2.INTER_CUBIC,
-                ),
-                NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                PrepareForNet(),
-            ]
-        )
-        flow_dataset = OpticalFlowDataset(dataset_cache_path, transform)
-        block.log("Created optical flow dataset.")
-
     with TimerBlock("Fine Tune Depth Estimation Model") as block:
-        data_loader = DataLoader(flow_dataset, batch_size=8)
-        block.log("Created data loader for optical flow dataset.")
-
-        K = camera.get_matrix()
-        K_inverse = np.linalg.inv(K)
-
-        def flow_displaced_point(x, optical_flow_field):
-            return np.array(x + optical_flow_field[x], dtype=np.int)
-
-        def point2d_to_homogeneous_point3d(x):
-            return np.array([*x, 1.0, 1.0])
-
-        def point2d_to_point3d(x, depth, K_inv):
-            return depth * np.matmul(K_inv, point2d_to_homogeneous_point3d(x))
-
-        def projected_point3d(x, i, j, K_inv):
-            c_i = point2d_to_point3d(x, depth_maps[i][x], K_inv)
-            R_i, t_i = poses_by_image[i].R, poses_by_image[i].t
-            R_j, t_j = poses_by_image[j].R, poses_by_image[j].t
-
-            return R_j.as_matrix() * (R_i.as_matrix() * c_i + point2d_to_homogeneous_point3d(t_i) - point2d_to_homogeneous_point3d(t_j))
-
-        def homogeneous_point3d_to_point2d(c):
-            x, y, z, _ = c
-            return np.array([[x / z, y / z]]).T
-
-        def frame_j_pos(c, K):
-            return homogeneous_point3d_to_point2d(K * c)
-
-        def spatial_loss(p, f):
-            return torch.dist(p, f)
-
-        def disparity_loss(x, z_i, z_ij, camera, optical_flow_field):
-            return camera.focal_length * torch.abs(1.0 / z_i[x] - 1.0 / z_ij[flow_displaced_point(x, optical_flow_field)])
-
-        def loss_func(x, i, j, valid_mask, K, K_inv, optical_flow_field, balancing_coefficient=0.1):
-            c = projected_point3d(x, i, j, K_inv)
-            p = frame_j_pos(c, K)
-            loss_terms = spatial_loss(p, f) * balancing_coefficient * disparity_loss(x, c[2], p[2], camera, optical_flow_field)
-            return 1 / valid_mask.sum() * torch.sum(loss_terms[valid_mask])
-
-        block.log("Created loss function.")
+        # TODO: Load dataset
+        # TODO: Load depth estimation network
+        # TODO: Define loss functions
         # TODO: Optimise depth estimation network
         # TODO: Save optimised depth estimation network weights
+        pass
 
     with TimerBlock("Generate Refined Depth Maps") as block:
         # TODO: Generate depth maps for each frame.
