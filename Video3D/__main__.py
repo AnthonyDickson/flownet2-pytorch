@@ -431,7 +431,7 @@ def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: 
                 optical_flow = flow_net(images_tensor)
                 optical_flow = torch.nn.functional.interpolate(optical_flow, size=(height, width),
                                                                mode='bilinear', align_corners=True)
-                optical_flow = optical_flow.squeeze().permute((1, 2, 0)).cpu().numpy()
+                optical_flow = optical_flow.squeeze().cpu().numpy()
 
                 return optical_flow
 
@@ -451,7 +451,9 @@ def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: 
                     # flow vector are within 1px error.
                     # However, we need it to indicate this on a per-pixel basis, so we combine the binary maps of the u
                     # and v components to give us the validity of the optical flow at the given pixel.
-                    valid_mask = valid_mask[:, :, 0] & valid_mask[:, :, 1]
+                    valid_mask = valid_mask[0, :, :] & valid_mask[1, :, :]
+                    # Ensure that valid mask is a CHW tensor to follow with PyTorch's conventions of dimension ordering.
+                    valid_mask = np.expand_dims(valid_mask, axis=0)
 
                     # TODO: Check if `delta = np.sum(np.abs(a - b), axis=-1) <= 1` would do the same thing as above.
                     should_keep_frame = np.mean(valid_mask) >= 0.8
