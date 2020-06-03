@@ -15,7 +15,7 @@ PyTorch implementation [4].
     2.  Generate dense optical flow for the frame pair.
     3.  Filter frame pairs based on the consistency of the optical flow.
 9.  Create a dataset from the frame pairs and optical flow fields.
-10. [TODO] Perform test-time training on the monocular depth estimation network.
+10. Perform test-time training on the monocular depth estimation network.
 11. [TODO] Generate depth maps for the video using the trained network. 
 
 ## Getting Started

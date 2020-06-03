@@ -1,5 +1,6 @@
 import os
 import pickle
+import warnings
 
 import cv2
 import numpy as np
@@ -28,19 +29,14 @@ def unwrap_MiDaS_transform(x):
     model_path=plac.Annotation("The path to the pretrained model weights", type=str, kind="option", abbrev="m"),
     dataset_path=plac.Annotation("The path to the frame pair and optical flow dataset.", type=str, kind="option",
                                  abbrev="d"),
-    colmap_output_cache_path=plac.Annotation("The path to the processed COLMAP output.", type=str, kind="option",
-                                             abbrev="c"),
+    cache_dir=plac.Annotation("Where to save intermediate results to (such as the trained model weights).", type=str, kind="option", abbrev="c"),
 )
-def main(model_path, dataset_path, colmap_output_cache_path, num_epochs=20, batch_size=4, lr=0.0004,
-         balancing_coefficient=0.1):
-    with TimerBlock("Setup") as block:
-        for filename in os.listdir(dataset_path):
-            if filename.endswith(".png"):
-                img = cv2.imread(os.path.join(dataset_path, filename))
-                height, width, _ = img.shape
+def train(model_path, dataset_path, cache_dir, num_epochs=20, batch_size=4, lr=0.0004,
+          balancing_coefficient=0.1):
+    trained_model_weights_cache_path = os.path.join(cache_dir, "optimised_depth_estimation_model.pt")
+    trained_model_checkpoint_cache_path = os.path.join(cache_dir, "depth_estimation_model_checkpoint.pt")
 
-                break
-
+    with TimerBlock("Optimise Network") as block:
         transform = Compose(
             [
                 wrap_MiDaS_transform,
@@ -66,12 +62,13 @@ def main(model_path, dataset_path, colmap_output_cache_path, num_epochs=20, batc
         data_loader = DataLoader(flow_dataset, batch_size=batch_size, shuffle=True)
         block.log("Created data loader for optical flow dataset.")
 
-        model = MidasNet(model_path, non_negative=True)
+        model = MidasNet(model_path, non_negative=False)
         model = model.cuda()
         model.load_state_dict(torch.load(model_path, map_location="cpu"))
         block.log("Loaded depth estimation model.")
 
         optimiser = torch.optim.Adam(model.parameters(), lr=lr)
+        lr_scheduler = torch.optim.lr_scheduler.StepLR(optimiser, step_size=5, gamma=0.1)
 
         K = flow_dataset.metadata.camera.get_matrix()
         K = Camera.to_homogeneous_matrix(K)
@@ -83,10 +80,46 @@ def main(model_path, dataset_path, colmap_output_cache_path, num_epochs=20, batc
 
         focal_length = flow_dataset.metadata.camera.focal_length
 
+        batch = flow_dataset[0]
+        optical_flow_mask = batch[-1]
+        _, height, width = optical_flow_mask.shape
+
+        x = torch.from_numpy(np.array(np.meshgrid(range(width), range(height)), dtype=np.float32))
+        x_ = torch.ones(size=(4, *x.shape[1:]), dtype=torch.float32)
+        x_[:2, :, :] = x
+
+        x = x.cuda()
+        x_ = x_.cuda()
+
         def point3d_to_point2d(x):
             return x[:2] / x[2]
 
+        class RunningAverage:
+            def __init__(self):
+                self.count = 0
+                self.sum = 0
+
+            def update(self, value, count=1):
+                if value == float('inf'):
+                    warnings.warn("{} got a invalid value of {}.".format(self.__class__.__name__, value))
+                else:
+                    self.sum += value
+                    self.count += count
+
+            @property
+            def value(self):
+                try:
+                    return self.sum / self.count
+                except ZeroDivisionError:
+                    return float('nan')
+
+        best_loss = float('inf')
+
         for epoch in range(num_epochs):
+            block.log("Epoch {}/{}".format(epoch + 1, num_epochs))
+            epoch_loss = RunningAverage()
+            epoch_progress = 0
+
             for batch in data_loader:
                 frame_i, _, R_i, t_i, R_j, t_j, optical_flow, valid_mask = batch
                 batch_size, _, height, width = optical_flow.shape
@@ -96,24 +129,18 @@ def main(model_path, dataset_path, colmap_output_cache_path, num_epochs=20, batc
                 depth_i = model(frame_i.cuda())
                 depth_i = F.interpolate(depth_i.unsqueeze(1), size=(height, width), mode="bilinear", align_corners=True)
 
-                f_ij = torch.zeros((batch_size, 2, height, width)).cuda()
+                # TODO: Tidy up loss function and refactor into function or something?
                 p_ij = torch.zeros((batch_size, 2, height, width)).cuda()
                 disparity_ij = torch.zeros((batch_size, 1, height, width)).cuda()
                 R_i, t_i, R_j, t_j, optical_flow, valid_mask = R_i.cuda(), t_i.cuda(), R_j.cuda(), t_j.cuda(), optical_flow.cuda(), valid_mask.cuda()
 
+                f_ij = optical_flow + torch.stack(batch_size * [x], dim=0)
+
                 # TODO: Vectorise this...
                 for batch_i in range(batch_size):
-                    x = torch.from_numpy(np.array(np.meshgrid(range(width), range(height)), dtype=np.float32))
-                    x_ = torch.ones(size=(4, *x.shape[1:]), dtype=torch.float32)
-                    x_[:2, :, :] = x
-
-                    x = x.cuda()
-                    x_ = x_.cuda()
-
-                    f_ij[batch_i] = optical_flow[batch_i] + x
                     # The tensordot function will essentially take K^-1 * x_ for every pixel.
                     c_i = depth_i[batch_i] * torch.tensordot(K_inverse, x_, dims=1)
-                    c_ij = torch.tensordot(R_j[batch_i].T, torch.tensordot(R_i[batch_i], c_i, dims=1) + (t_i[batch_i] - t_j[batch_i]).unsqueeze(2), dims=1)
+                    c_ij = torch.tensordot(torch.transpose(R_j[batch_i], 0, 1), torch.tensordot(R_i[batch_i], c_i, dims=1) + (t_i[batch_i] - t_j[batch_i]).unsqueeze(-1), dims=1)
 
                     c_ij_homogeneous = torch.ones(size=(4, *c_ij.shape[1:]), dtype=c_ij.dtype, device=c_ij.device)
                     c_ij_homogeneous[:-1] = c_ij
@@ -126,12 +153,28 @@ def main(model_path, dataset_path, colmap_output_cache_path, num_epochs=20, batc
                 l_spatial = torch.sqrt(torch.sum(torch.pow((f_ij - p_ij), 2)[stacked_valid_mask]))
                 l_disparity = focal_length * torch.sum(torch.abs(disparity_ij[valid_mask]))
 
-                loss = 1.0 / valid_mask.to(torch.float32).sum() * (l_spatial + balancing_coefficient * l_disparity)
+                num_valid_pixels = valid_mask.to(torch.float32).sum()
+                weighted_loss = l_spatial + balancing_coefficient * l_disparity
+
+                loss = 1.0 / num_valid_pixels * weighted_loss
 
                 loss.backward()
+                optimiser.step()
+                lr_scheduler.step()
 
-            # TODO: Log progress and loss
+                epoch_progress += batch_size
+                epoch_loss.update(weighted_loss.item(), num_valid_pixels.item())
+                block.log("Epoch Progress: {:04d}/{:04d} - Loss {:.4f} (Epoch Avg.: {:.4f})\r".format(epoch_progress, len(flow_dataset), loss.item(), epoch_loss.value), end="")
+
+            print()
+
+            torch.save(model.state_dict(), trained_model_checkpoint_cache_path)
+
+            if epoch_loss.value < best_loss:
+                best_loss = epoch_loss.value
+                torch.save(model.state_dict(), trained_model_weights_cache_path)
+                block.log("Saved best model weights to {}.".format(trained_model_weights_cache_path))
 
 
 if __name__ == '__main__':
-    plac.call(main)
+    plac.call(train)
