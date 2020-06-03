@@ -52,6 +52,9 @@ def align_images(query_img, train_img, draw_matches=False):
     dst_pts = np.float32([train_key_points[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
     H, _ = cv2.findHomography(dst_pts, src_pts, cv2.RANSAC, 5.0)
 
+    if H is None:
+        raise ValueError("Could not find homography.")
+
     return cv2.warpPerspective(train_img, H, tuple(reversed(train_img.shape[:2])))
 
 

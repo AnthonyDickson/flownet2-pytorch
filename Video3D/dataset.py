@@ -2,12 +2,14 @@ import json
 import os
 import pickle
 import warnings
-from typing import Optional
+from typing import Optional, List
 
 import cv2
 import numpy as np
 from torch.utils.data import Dataset
+from torchvision.transforms import Compose
 
+from MiDaS.models.transforms import Resize, NormalizeImage, PrepareForNet
 from Video3D.colmap_parsing import Camera, CameraPose
 
 
@@ -134,7 +136,7 @@ class OpticalFlowDatasetBuilder:
             os.makedirs(dir_name)
 
     def add(self, i, j, frame_i, frame_j, optical_flow_field, valid_mask, camera_poses):
-        assert frame_i.shape[:2] == frame_j.shape[:2] == optical_flow_field.shape[:2] == valid_mask.shape[:2], \
+        assert frame_i.shape[:2] == frame_j.shape[:2] == optical_flow_field.shape[-2:] == valid_mask.shape[-2:], \
             "The frames, optical flow field and optical flow mask must all have the same spatial dimensions. " \
             "Got {}, {}, {} and {}." \
                 .format(frame_i.shape[:2], frame_j.shape[:2], optical_flow_field.shape[:2], valid_mask.shape[:2])
@@ -247,3 +249,53 @@ class OpticalFlowDataset(Dataset):
 
     def __len__(self):
         return self.metadata.length
+
+
+class NumpyDataset(Dataset):
+    def __init__(self, arrays: List[np.ndarray], to_tensor_transform: Compose):
+        """Dataset wrapping numpy arrays.
+
+        Each sample will be retrieved by indexing tensors along the first dimension.
+
+        :param arrays: numpy arrays that all have the same shape.
+        :param to_tensor_transform: The transform that takes a numpy array and converts it to a torch Tensor object.
+        """
+        assert all(arrays[0].shape == tensor.shape for tensor in arrays)
+        self.arrays = arrays
+        self.to_tensor = to_tensor_transform
+
+    def __getitem__(self, index):
+        return self.to_tensor(self.arrays[index])
+
+    def __len__(self):
+        return len(self.arrays)
+
+
+def wrap_MiDaS_transform(x):
+    return {"image": x}
+
+
+def unwrap_MiDaS_transform(x):
+    return x["image"]
+
+
+def create_image_transform(height, width):
+    transform = Compose(
+        [
+            wrap_MiDaS_transform,
+            Resize(
+                width,
+                height,
+                resize_target=None,
+                keep_aspect_ratio=True,
+                ensure_multiple_of=32,
+                resize_method="upper_bound",
+                image_interpolation_method=cv2.INTER_CUBIC,
+            ),
+            NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            PrepareForNet(),
+            unwrap_MiDaS_transform
+        ]
+    )
+
+    return transform

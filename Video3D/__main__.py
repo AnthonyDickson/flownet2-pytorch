@@ -1,126 +1,55 @@
 import math
 import os
 import pickle
-from typing import List
+import warnings
 
 import cv2
 import numpy as np
 import plac
 import torch
-from torch.utils.data import DataLoader, Dataset
-from torchvision.transforms import Compose
 from torch.nn import functional as F
+from torchvision.transforms import Compose
 
-import sys
-
-from Video3D.train_depth_dnn import train, unwrap_MiDaS_transform, wrap_MiDaS_transform
-
-sys.path.insert(0, '..')
-
-from MiDaS.models.midas_net import MidasNet
-from MiDaS.models.transforms import Resize, NormalizeImage, PrepareForNet
+from MiDaS.models.transforms import Resize
 from Video3D.align_images import align_images
 from Video3D.colmap_parsing import parse_cameras, parse_images, parse_points
-from Video3D.dataset import OpticalFlowDatasetBuilder
+from Video3D.dataset import OpticalFlowDatasetBuilder, wrap_MiDaS_transform, unwrap_MiDaS_transform, \
+    create_image_transform
+from Video3D.inference import inference
+from Video3D.io import read_video, write_video
+from Video3D.training import train
 from models import FlowNet2
 from utils.tools import TimerBlock
 
 
-def sample_frame_pairs(num_frames):
-    frame_pairs = {(i, i + 1) for i in range(num_frames - 1)}
-
-    for l in range(math.floor(math.log2(num_frames - 1)) + 1):
-        sl = {(i, i + 2 ** l) for i in range(num_frames - 2 ** l) if i % 2 ** (l - 1) == 0}
-        frame_pairs = frame_pairs.union(sl)
-
-    return frame_pairs
-
-
-class NumpyDataset(Dataset):
-    def __init__(self, arrays: List[np.ndarray], to_tensor_transform: Compose):
-        """Dataset wrapping numpy arrays.
-
-        Each sample will be retrieved by indexing tensors along the first dimension.
-
-        :param arrays: numpy arrays that all have the same shape.
-        :param to_tensor_transform: The transform that takes a numpy array and converts it to a torch Tensor object.
-        """
-        assert all(arrays[0].shape == tensor.shape for tensor in arrays)
-        self.arrays = arrays
-        self.to_tensor = to_tensor_transform
-
-    def __getitem__(self, index):
-        return self.to_tensor(self.arrays[index])
-
-    def __len__(self):
-        return len(self.arrays)
-
-
-# TODO: Add flag for clearing cache.
-def generate_depth_maps(depth_estimation_model_path, frames, width, height, logger, dnn_depth_map_cache_path):
+def parse_colmap_output(colmap_output_path, cache_path, colmap_cache_path, logger):
     try:
-        depth_maps = np.load(dnn_depth_map_cache_path)
-        logger.log("Loaded DNN depth maps from {}.".format(dnn_depth_map_cache_path))
-    except IOError:
-        transform = Compose(
-            [
-                Resize(
-                    width,
-                    height,
-                    resize_target=None,
-                    keep_aspect_ratio=True,
-                    ensure_multiple_of=32,
-                    resize_method="upper_bound",
-                    image_interpolation_method=cv2.INTER_CUBIC,
-                ),
-                NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                PrepareForNet(),
-            ]
-        )
+        with open(colmap_cache_path, 'rb') as f:
+            camera, poses_by_image, points2d_by_image, points3d_by_id = pickle.load(f)
 
-        logger.log("Created image transform.")
+        logger.log("Loaded parsed COLMAP output from {}.".format(colmap_cache_path))
+    except FileNotFoundError:
+        cameras_txt = os.path.join(colmap_output_path, "cameras.txt")
+        images_txt = os.path.join(colmap_output_path, "images.txt")
+        points_3d_txt = os.path.join(colmap_output_path, "points3D.txt")
 
-        video_dataset = NumpyDataset(frames, transform)
-        logger.log("Created dataset.")
+        camera = parse_cameras(cameras_txt)[0]
+        logger.log("Parsed camera intrinsics.")
 
-        model = MidasNet(depth_estimation_model_path, non_negative=True)
-        model = model.cuda(0)
-        model.load_state_dict(torch.load(depth_estimation_model_path, map_location="cpu"))
-        model.eval()
-        logger.log("Loaded depth estimation model.")
+        poses_by_image, points2d_by_image = parse_images(images_txt)
+        logger.log("Parsed camera poses and 2D points.")
 
-        depth_maps = []
-        sequential_dataloader = DataLoader(video_dataset, batch_size=8, shuffle=False)
-        frame_i = 0
+        points3d_by_id = parse_points(points_3d_txt)
+        logger.log("Parsed 3D points.")
 
-        with torch.no_grad():
-            for batch in sequential_dataloader:
-                imgs = batch["image"]
-                imgs = imgs.cuda()
-                prediction = model(imgs)
-                depth_maps.append(prediction.cpu())
+        if not os.path.isdir(cache_path):
+            os.makedirs(cache_path)
 
-                frame_i += imgs.shape[0]
-                logger.log("Generated {:02d} frames.\r".format(frame_i), end="")
+        with open(colmap_cache_path, 'wb') as f:
+            pickle.dump((camera, poses_by_image, points2d_by_image, points3d_by_id), f)
 
-        logger.log("Generated {} depth maps.".format(len(depth_maps)))
-
-        depth_maps = torch.cat(depth_maps, dim=0)
-        logger.log("Concatenated depth maps.")
-
-        output_shape = depth_maps.shape[-2:]
-
-        depth_maps = F.interpolate(depth_maps.unsqueeze(1), size=(width, height),
-                                   mode='bilinear', align_corners=True)
-
-        # Network produces output as NCWH - dropped channel since output is B&W and just need to change to NHW.
-        depth_maps = depth_maps.squeeze().permute((0, 2, 1)).to(torch.float32).cpu().numpy()
-        logger.log("Resized depth maps back to {} from {}.".format(depth_maps.shape[-2:], output_shape))
-
-        np.save(dnn_depth_map_cache_path, depth_maps)
-        logger.log("Saved DNN depth maps to {}.".format(dnn_depth_map_cache_path))
-
-    return depth_maps
+        logger.log("Saved parsed COLMAP output to {}.".format(colmap_cache_path))
+    return camera, points2d_by_image, points3d_by_id, poses_by_image
 
 
 def generate_sparse_depth_maps(camera, points2d_by_image, points3d_by_id, logger, sparse_depth_map_cache_path):
@@ -129,6 +58,8 @@ def generate_sparse_depth_maps(camera, points2d_by_image, points3d_by_id, logger
         logger.log("Loaded sparse depth maps from {}.".format(sparse_depth_map_cache_path))
     except IOError:
         sparse_depth_maps = []
+
+        num_frames = len(points2d_by_image)
 
         for points in points2d_by_image.values():
             depth_map = np.zeros(shape=camera.shape, dtype=np.float32)
@@ -141,140 +72,157 @@ def generate_sparse_depth_maps(camera, points2d_by_image, points3d_by_id, logger
 
             sparse_depth_maps.append(depth_map)
 
-        sparse_depth_maps = np.array(sparse_depth_maps, dtype=np.float32)
-        logger.log("Generated sparse depth maps for each frame.")
+            logger.log("Generated {}/{} sparse depth maps.\r".format(len(sparse_depth_maps), num_frames), end="")
 
+        print()
+
+        sparse_depth_maps = np.array(sparse_depth_maps, dtype=np.float32)
         np.save(sparse_depth_map_cache_path, sparse_depth_maps)
         logger.log("Saved sparse depth maps to {}.".format(sparse_depth_map_cache_path))
+
     return sparse_depth_maps
 
 
-class CustomResize(object):
-    """Resize sample to given size (width, height)."""
+def calculate_global_scale_adjustment_factor(video_data, camera, points2d_by_image, points3d_by_id,
+                                             depth_estimation_model_path, dnn_depth_map_cache_path,
+                                             sparse_depth_map_cache_path, relative_depth_scale_cache_path, logger):
+    try:
+        with open(relative_depth_scale_cache_path, 'rb') as f:
+            relative_depth_scale = pickle.load(f)
 
-    def __init__(
-            self,
-            width,
-            height,
-            resize_target=True,
-            keep_aspect_ratio=False,
-            ensure_multiple_of=1,
-            resize_method="lower_bound",
-            image_interpolation_method=cv2.INTER_AREA,
-    ):
-        """Init.
+        logger.log("Loaded relative depth scale from {}".format(relative_depth_scale_cache_path))
+    except FileNotFoundError:
+        try:
+            depth_maps = np.load(dnn_depth_map_cache_path)
+            logger.log("Loaded DNN depth maps from {}.".format(dnn_depth_map_cache_path))
+        except IOError:
+            depth_maps = inference(video_data, depth_estimation_model_path, logger, batch_size=4).squeeze()
 
-        Args:
-            width (int): desired output width
-            height (int): desired output height
-            resize_target (bool, optional):
-                True: Resize the full sample (image, mask, target).
-                False: Resize image only.
-                Defaults to True.
-            keep_aspect_ratio (bool, optional):
-                True: Keep the aspect ratio of the input sample.
-                Output sample might not have the given width and height, and
-                resize behaviour depends on the parameter 'resize_method'.
-                Defaults to False.
-            ensure_multiple_of (int, optional):
-                Output width and height is constrained to be multiple of this parameter.
-                Defaults to 1.
-            resize_method (str, optional):
-                "lower_bound": Output will be at least as large as the given size.
-                "upper_bound": Output will be at max as large as the given size. (Output size might be smaller than given size.)
-                "minimal": Scale as least as possible.  (Output size might be smaller than given size.)
-                Defaults to "lower_bound".
-        """
-        self.__width = width
-        self.__height = height
+            np.save(dnn_depth_map_cache_path, depth_maps)
+            logger.log("Saved DNN depth maps to {}.".format(dnn_depth_map_cache_path))
 
-        self.__resize_target = resize_target
-        self.__keep_aspect_ratio = keep_aspect_ratio
-        self.__multiple_of = ensure_multiple_of
-        self.__resize_method = resize_method
-        self.__image_interpolation_method = image_interpolation_method
+        sparse_depth_maps = generate_sparse_depth_maps(camera, points2d_by_image, points3d_by_id, logger,
+                                                       sparse_depth_map_cache_path)
 
-    def constrain_to_multiple_of(self, x, min_val=0, max_val=None):
-        y = (np.round(x / self.__multiple_of) * self.__multiple_of).astype(int)
+        zero_mask = sparse_depth_maps == 0
 
-        if max_val is not None and y > max_val:
-            y = (np.floor(x / self.__multiple_of) * self.__multiple_of).astype(int)
+        relative_depth_scale = np.divide(depth_maps, sparse_depth_maps, dtype=np.float32)
+        relative_depth_scale[zero_mask] = np.nan
+        relative_depth_scale = np.nanmedian(relative_depth_scale, axis=[-2, -1])
+        relative_depth_scale = np.mean(relative_depth_scale)
 
-        if y < min_val:
-            y = (np.ceil(x / self.__multiple_of) * self.__multiple_of).astype(int)
+        logger.log("Calculated relative depth scale factor: {:.2f}.".format(relative_depth_scale))
 
-        return y
+        with open(relative_depth_scale_cache_path, 'wb') as f:
+            pickle.dump(relative_depth_scale, f)
 
-    def get_size(self, width, height):
-        # determine new height and width
-        scale_height = self.__height / height
-        scale_width = self.__width / width
+        logger.log("Saved relative depth scale factor to {}.".format(relative_depth_scale_cache_path))
+    return relative_depth_scale
 
-        if self.__keep_aspect_ratio:
-            if self.__resize_method == "lower_bound":
-                # scale such that output size is lower bound
-                if scale_width > scale_height:
-                    # fit width
-                    scale_height = scale_width
-                else:
-                    # fit height
-                    scale_width = scale_height
-            elif self.__resize_method == "upper_bound":
-                # scale such that output size is upper bound
-                if scale_width < scale_height:
-                    # fit width
-                    scale_height = scale_width
-                else:
-                    # fit height
-                    scale_width = scale_height
-            elif self.__resize_method == "minimal":
-                # scale as least as possbile
-                if abs(1 - scale_width) < abs(1 - scale_height):
-                    # fit width
-                    scale_height = scale_width
-                else:
-                    # fit height
-                    scale_width = scale_height
+
+def sample_frame_pairs(num_frames):
+    frame_pairs = {(i, i + 1) for i in range(num_frames - 1)}
+
+    for l in range(math.floor(math.log2(num_frames - 1)) + 1):
+        sl = {(i, i + 2 ** l) for i in range(num_frames - 2 ** l) if i % 2 ** (l - 1) == 0}
+        frame_pairs = frame_pairs.union(sl)
+
+    return frame_pairs
+
+
+def create_optical_flow_dataset(video_data, camera, poses_by_image, optical_flow_model_path, dataset_cache_path,
+                                logger):
+    frame_pair_indexes = sample_frame_pairs(video_data.num_frames)
+    logger.log("Sampled frame pairs")
+
+    # TODO: Make this less hacky...
+    # Simulate argparse object because I'm too lazy to implement it properly.
+    class Object(object):
+        pass
+
+    args = Object()
+    args.fp16 = False
+    args.rgb_max = 255
+
+    t = Compose(
+        [
+            wrap_MiDaS_transform,
+            Resize(
+                video_data.width,
+                video_data.height,
+                resize_target=None,
+                keep_aspect_ratio=True,
+                ensure_multiple_of=64,
+                resize_method="upper_bound",
+                image_interpolation_method=cv2.INTER_CUBIC,
+            ),
+            unwrap_MiDaS_transform
+        ]
+    )
+
+    flow_net = FlowNet2(args).cuda()
+    flow_net.load_state_dict(torch.load(optical_flow_model_path)["state_dict"])
+    logger.log("Loaded optical flow model from {}.".format(optical_flow_model_path))
+    os.makedirs(dataset_cache_path)
+    num_filtered = 0
+
+    def calculate_optical_flow(frame_i, frame_j):
+        images = list(map(t, (frame_i, frame_j)))
+        images = np.array(images).transpose((3, 0, 1, 2))
+        images_tensor = torch.from_numpy(images).unsqueeze(0).to(torch.float32).cuda()
+
+        optical_flow = flow_net(images_tensor)
+        optical_flow = F.interpolate(optical_flow, size=(video_data.height, video_data.width),
+                                     mode='bilinear', align_corners=True)
+        optical_flow = optical_flow.squeeze().cpu().numpy()
+
+        return optical_flow
+
+    with torch.no_grad(), OpticalFlowDatasetBuilder(dataset_cache_path, camera) as dataset_builder:
+        for pair_index, (i, j) in enumerate(frame_pair_indexes):
+            frame_i = video_data.frames[i]
+            frame_j = video_data.frames[j]
+            frame_i_aligned = None
+            frame_j_aligned = None
+
+            try:
+                frame_j_aligned = align_images(frame_i, frame_j)
+            except ValueError:
+                warnings.warn("Could not align frame #{} and #{}.".format(i, j))
+                continue
+
+            try:
+                frame_i_aligned = align_images(video_data.frames[j], video_data.frames[i])
+            except ValueError:
+                warnings.warn("Could not align frame #{} and #{}.".format(j, i))
+                continue
+
+            optical_flow_forwards = calculate_optical_flow(frame_i, frame_j_aligned)
+            optical_flow_backwards = calculate_optical_flow(frame_i_aligned, video_data.frames[j])
+
+            delta = np.abs(optical_flow_forwards - optical_flow_backwards)
+            valid_mask = (delta <= 1).astype(np.bool)
+            # `valid_mask` is up to this point, indicating if each of the u and v components of each optical
+            # flow vector are within 1px error.
+            # However, we need it to indicate this on a per-pixel basis, so we combine the binary maps of the u
+            # and v components to give us the validity of the optical flow at the given pixel.
+            valid_mask = valid_mask[0, :, :] & valid_mask[1, :, :]
+            # Ensure that valid mask is a CHW tensor to follow with PyTorch's conventions of dimension ordering.
+            valid_mask = np.expand_dims(valid_mask, axis=0)
+
+            # TODO: Check if `delta = np.sum(np.abs(a - b), axis=-1) <= 1` would do the same thing as above.
+            should_keep_frame = np.mean(valid_mask) >= 0.8
+
+            if should_keep_frame:
+                dataset_builder.add(i, j, frame_i, frame_j, optical_flow_forwards, valid_mask, poses_by_image)
             else:
-                raise ValueError(
-                    "resize_method {} not implemented".format(self.__resize_method)
-                )
+                num_filtered += 1
 
-        if self.__resize_method == "lower_bound":
-            new_height = self.constrain_to_multiple_of(
-                scale_height * height, min_val=self.__height
-            )
-            new_width = self.constrain_to_multiple_of(
-                scale_width * width, min_val=self.__width
-            )
-        elif self.__resize_method == "upper_bound":
-            new_height = self.constrain_to_multiple_of(
-                scale_height * height, max_val=self.__height
-            )
-            new_width = self.constrain_to_multiple_of(
-                scale_width * width, max_val=self.__width
-            )
-        elif self.__resize_method == "minimal":
-            new_height = self.constrain_to_multiple_of(scale_height * height)
-            new_width = self.constrain_to_multiple_of(scale_width * width)
-        else:
-            raise ValueError("resize_method {} not implemented".format(self.__resize_method))
-
-        return (new_width, new_height)
-
-    def __call__(self, sample):
-        width, height = self.get_size(
-            sample.shape[1], sample.shape[0]
-        )
-
-        # resize sample
-        sample = cv2.resize(
-            sample,
-            (width, height),
-            interpolation=self.__image_interpolation_method,
-        )
-
-        return sample
+            logger.log("Processed {} frame pairs out of {} ({} kept, {} filtered out).\r"
+                       .format(pair_index + 1, len(frame_pair_indexes), pair_index + 1 - num_filtered,
+                               num_filtered), end="")
+    print()
+    logger.log("Saved dataset to {}.".format(dataset_cache_path))
 
 
 @plac.annotations(
@@ -301,98 +249,24 @@ def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: 
     relative_depth_scale_cache_path = os.path.join(cache_path, "relative_depth_scale.pkl")
     dataset_cache_path = os.path.join(cache_path, "dataset")
     optimised_dnn_weights_cache_path = os.path.join(cache_path, "optimised_depth_estimation_model.pt")
+    optimised_dnn_checkpoint_cache_path = os.path.join(cache_path, "depth_estimation_model_checkpoint.pt")
 
     with TimerBlock("Load Video") as block:
-        input_video = cv2.VideoCapture(video_path)
-
-        if not input_video.isOpened():
-            raise RuntimeError("Could not open video from the path {}.".format(video_path))
-
-        block.log("Opened video from path the {}.".format(video_path))
-
-        frames = []
-
-        while input_video.isOpened():
-            has_frame, frame = input_video.read()
-
-            if not has_frame:
-                break
-
-            frames.append(frame)
-
-        block.log("Extracted video frames.")
-
-        width = int(input_video.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(input_video.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        block.log("Got video dimensions: {}x{}.".format(width, height))
-
-        num_frames = int(input_video.get(cv2.CAP_PROP_FRAME_COUNT))
-        block.log("Got number of frames: {}.".format(num_frames))
-
-        fps = input_video.get(cv2.CAP_PROP_FPS)
-        block.log("Got frames per second: {}.".format(fps))
-
-        if input_video.isOpened():
-            input_video.release()
+        video_data = read_video(video_path, block)
 
     if not os.path.isdir(dataset_cache_path):
         with TimerBlock("Parse COLMAP Output") as block:
-            try:
-                with open(colmap_cache_path, 'rb') as f:
-                    camera, poses_by_image, points2d_by_image, points3d_by_id = pickle.load(f)
-
-                block.log("Loaded parsed COLMAP output from {}.".format(colmap_cache_path))
-            except FileNotFoundError:
-                cameras_txt = os.path.join(colmap_output_path, "cameras.txt")
-                images_txt = os.path.join(colmap_output_path, "images.txt")
-                points_3d_txt = os.path.join(colmap_output_path, "points3D.txt")
-
-                camera = parse_cameras(cameras_txt)[0]
-                block.log("Parsed camera intrinsics.")
-
-                poses_by_image, points2d_by_image = parse_images(images_txt)
-                block.log("Parsed camera poses and 2D points.")
-
-                points3d_by_id = parse_points(points_3d_txt)
-                block.log("Parsed 3D points.")
-
-                if not os.path.isdir(cache_path):
-                    os.makedirs(cache_path)
-
-                with open(colmap_cache_path, 'wb') as f:
-                    pickle.dump((camera, poses_by_image, points2d_by_image, points3d_by_id), f)
-
-                block.log("Saved parsed COLMAP output to {}.".format(colmap_cache_path))
+            camera, points2d_by_image, points3d_by_id, poses_by_image = parse_colmap_output(colmap_output_path,
+                                                                                            cache_path,
+                                                                                            colmap_cache_path, block)
 
         with TimerBlock("Calculate Relative Depth Scaling Factor") as block:
-            try:
-                with open(relative_depth_scale_cache_path, 'rb') as f:
-                    relative_depth_scale = pickle.load(f)
-
-                block.log("Loaded relative depth scale from {}".format(relative_depth_scale_cache_path))
-            except FileNotFoundError:
-                depth_maps = generate_depth_maps(depth_estimation_model_path, frames, width, height, block,
-                                                 dnn_depth_map_cache_path)
-
-                sparse_depth_maps = generate_sparse_depth_maps(camera, points2d_by_image, points3d_by_id, block,
-                                                               sparse_depth_map_cache_path)
-
-                zero_mask = sparse_depth_maps == 0
-
-                relative_depth_scale = np.divide(depth_maps, sparse_depth_maps, dtype=np.float32)
-                relative_depth_scale[zero_mask] = np.nan
-                relative_depth_scale = np.nanmedian(relative_depth_scale, axis=[1, 2])
-                relative_depth_scale = np.mean(relative_depth_scale)
-                block.log("Calculated relative depth scale factor: {:.2f}.".format(relative_depth_scale))
-
-                del depth_maps
-                del sparse_depth_maps
-                block.log("Freed memory used by depth maps.")
-
-                with open(relative_depth_scale_cache_path, 'wb') as f:
-                    pickle.dump(relative_depth_scale, f)
-
-                block.log("Saved relative depth scale factor to {}.".format(relative_depth_scale_cache_path))
+            relative_depth_scale = calculate_global_scale_adjustment_factor(video_data, camera,
+                                                                            points2d_by_image, points3d_by_id,
+                                                                            depth_estimation_model_path,
+                                                                            dnn_depth_map_cache_path,
+                                                                            sparse_depth_map_cache_path,
+                                                                            relative_depth_scale_cache_path, block)
 
             for pose in poses_by_image.values():
                 pose.t = relative_depth_scale * pose.t
@@ -401,146 +275,26 @@ def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: 
                       .format(relative_depth_scale))
 
         with TimerBlock("Create Optical Flow Dataset") as block:
-            frame_pair_indexes = sample_frame_pairs(num_frames)
-            block.log("Sampled frame pairs")
+            create_optical_flow_dataset(video_data, camera, poses_by_image, optical_flow_model_path, dataset_cache_path,
+                                        block)
 
-            # TODO: Make this less hacky...
-            # Simulate argparse object because I'm too lazy to implement it properly.
-            class Object(object):
-                pass
-
-            args = Object()
-            args.fp16 = False
-            args.rgb_max = 255
-
-            t = CustomResize(
-                width,
-                height,
-                resize_target=None,
-                keep_aspect_ratio=True,
-                ensure_multiple_of=64,
-                resize_method="upper_bound",
-                image_interpolation_method=cv2.INTER_CUBIC,
-            )
-
-            flow_net = FlowNet2(args).cuda()
-            flow_net.load_state_dict(torch.load(optical_flow_model_path)["state_dict"])
-            block.log("Loaded optical flow model from {}.".format(optical_flow_model_path))
-
-            os.makedirs(dataset_cache_path)
-
-            num_filtered = 0
-
-            def calculate_optical_flow(frame_i, frame_j):
-                images = list(map(t, (frame_i, frame_j)))
-                images = np.array(images).transpose(3, 0, 1, 2)
-                images_tensor = torch.from_numpy(images.astype(np.float32)).unsqueeze(0).cuda()
-
-                optical_flow = flow_net(images_tensor)
-                optical_flow = torch.nn.functional.interpolate(optical_flow, size=(height, width),
-                                                               mode='bilinear', align_corners=True)
-                optical_flow = optical_flow.squeeze().cpu().numpy()
-
-                return optical_flow
-
-            with torch.no_grad(), OpticalFlowDatasetBuilder(dataset_cache_path, camera) as dataset_builder:
-                for pair_index, (i, j) in enumerate(frame_pair_indexes):
-                    frame_i = frames[i]
-                    frame_j = frames[j]
-                    frame_j_aligned = align_images(frame_i, frame_j)
-
-                    optical_flow_forwards = calculate_optical_flow(frame_i, frame_j_aligned)
-
-                    optical_flow_backwards = calculate_optical_flow(align_images(frames[j], frames[i]), frames[j])
-
-                    delta = np.abs(optical_flow_forwards - optical_flow_backwards)
-                    valid_mask = (delta <= 1).astype(np.bool)
-                    # `valid_mask` is up to this point, indicating if each of the u and v components of each optical
-                    # flow vector are within 1px error.
-                    # However, we need it to indicate this on a per-pixel basis, so we combine the binary maps of the u
-                    # and v components to give us the validity of the optical flow at the given pixel.
-                    valid_mask = valid_mask[0, :, :] & valid_mask[1, :, :]
-                    # Ensure that valid mask is a CHW tensor to follow with PyTorch's conventions of dimension ordering.
-                    valid_mask = np.expand_dims(valid_mask, axis=0)
-
-                    # TODO: Check if `delta = np.sum(np.abs(a - b), axis=-1) <= 1` would do the same thing as above.
-                    should_keep_frame = np.mean(valid_mask) >= 0.8
-
-                    if should_keep_frame:
-                        dataset_builder.add(i, j, frame_i, frame_j, optical_flow_forwards, valid_mask, poses_by_image)
-                    else:
-                        num_filtered += 1
-
-                    block.log("Processed {} frame pairs out of {} ({} kept, {} filtered out).\r"
-                              .format(pair_index + 1, len(frame_pair_indexes), pair_index + 1 - num_filtered,
-                                      num_filtered), end="")
-
-            print()
-            block.log("Saved dataset to {}.".format(dataset_cache_path))
+        del camera, points2d_by_image, points3d_by_id, poses_by_image
     else:
         print("Found dataset at {}.".format(dataset_cache_path))
 
     if not os.path.isfile(optimised_dnn_weights_cache_path):
-        train(depth_estimation_model_path, dataset_cache_path, cache_path)
+        with TimerBlock("Optimise Network") as block:
+            train(depth_estimation_model_path, optimised_dnn_weights_cache_path, optimised_dnn_checkpoint_cache_path,
+                  dataset_cache_path, block)
 
     with TimerBlock("Generate Refined Depth Maps") as block:
-        model = MidasNet(optimised_dnn_weights_cache_path, non_negative=True)
-        model = model.cuda()
-        model.eval()
-        block.log("Loaded optimised model weights from {}.".format(optimised_dnn_weights_cache_path))
+        depth_maps = inference(video_data, depth_estimation_model_path, block, scale_output=True, batch_size=4)
+        write_video(depth_maps, video_data, "output-before.avi", block)
+        block.log("Generated depth maps with un-optimised network.")
 
-        transform = Compose(
-            [
-                wrap_MiDaS_transform,
-                Resize(
-                    width,
-                    height,
-                    resize_target=None,
-                    keep_aspect_ratio=True,
-                    ensure_multiple_of=32,
-                    resize_method="upper_bound",
-                    image_interpolation_method=cv2.INTER_CUBIC,
-                ),
-                NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                PrepareForNet(),
-                unwrap_MiDaS_transform
-            ]
-        )
-
-        video_dataset = NumpyDataset(frames, transform)
-        data_loader = DataLoader(video_dataset, batch_size=4, shuffle=False)
-
-        with torch.no_grad():
-            num_frames_processed = 0
-            depth_maps = []
-
-            for batch_i, batch in enumerate(data_loader):
-                images = batch.cuda()
-                depth = model(images)
-                depth = F.interpolate(depth.unsqueeze(1), size=(width, height), mode='bilinear', align_corners=True)
-                depth_maps.append(depth.detach().cpu())
-
-                num_frames_processed += images.shape[0]
-
-                block.log("Generated {}/{} depth maps.\r".format(num_frames_processed, len(frames)), end="")
-
-        print()
-
-        depth_maps = torch.cat(depth_maps, dim=0)
-        depth_maps = (255 * (depth_maps - depth_maps.min()) / (depth_maps.max() - depth_maps.min())).to(torch.uint8)
-        depth_maps = depth_maps.permute((0, 3, 2, 1)).numpy()
-
-        video_output_path = os.path.abspath('output.avi')
-        video_writer = cv2.VideoWriter(video_output_path, cv2.VideoWriter_fourcc(*"DIVX"), fps, (width, height))
-
-        for i, depth_map in enumerate(depth_maps):
-            depth_frame = np.concatenate([depth_map] * 3, axis=-1)
-            video_writer.write(depth_frame)
-            block.log("Wrote {}/{} frames.\r".format(i + 1, len(depth_maps)), end="")
-
-        print()
-        block.log("Wrote depth video to {}.".format(video_output_path))
-        video_writer.release()
+        depth_maps = inference(video_data, optimised_dnn_weights_cache_path, block, scale_output=True, batch_size=4)
+        write_video(depth_maps, video_data, "output-after.avi", block)
+        block.log("Generated depth maps with optimised network.")
 
 
 if __name__ == '__main__':
