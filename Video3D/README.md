@@ -4,6 +4,7 @@ For the monocular depth estimation network I use MiDaS [2]. This project also re
 PyTorch implementation [4].
 
 ## Program Pipeline Overview
+### Depth Estimation Network Optimisation
 1.  Take video.
 2.  Run reconstruction algorithm on video with COLMAP.
 3.  Load video and COLMAP output into main routine of this package (`python -m Video3D`).
@@ -17,7 +18,11 @@ PyTorch implementation [4].
     3.  Filter frame pairs based on the consistency of the optical flow.
 9.  Create a dataset from the frame pairs and optical flow fields.
 10. Perform test-time training on the monocular depth estimation network.
-11. Generate depth maps for the video using the trained network. 
+
+### Uses of the Optimised Depth Estimation Network 
+- Generate depth maps for the given video.
+- [TODO] Generate per-frame point clouds.
+- [TODO] Generate per-frame triangle meshes.  
 
 ## Getting Started
 1.  Setup the depth estimation model: 
@@ -36,11 +41,15 @@ PyTorch implementation [4].
 By default, the script will cache intermediate results since they are usually too large to fit in memory. You can clear the cache if need be by simply removing the cache folder: `rm -r .cache/`.
 
 ## TODO
+-   Automate creation of folders etc.
 -   Automate extraction of video frames.
 -   Automate COLMAP reconstruction.
 -   Read binary COLMAP output from Python code.
 -   Generate examples of frame pairs and optical flow automatically.
 -   Visualise examples of optical flow with vector field.
+-   Create point clouds for each frame and each depth estimation model (before and after).
+-   Create 3D mesh from point clouds.
+
 ## References
 1. Luo, Xuan, Jia-Bin Huang, Richard Szeliski, Kevin Matzen, and Johannes Kopf. "Consistent Video Depth Estimation." arXiv preprint arXiv:2004.15021 (2020).
 2. Lasinger, Katrin, René Ranftl, Konrad Schindler, and Vladlen Koltun. "Towards robust monocular depth estimation: Mixing datasets for zero-shot cross-dataset transfer." arXiv preprint arXiv:1907.01341 (2019). https://github.com/intel-isl/MiDaS

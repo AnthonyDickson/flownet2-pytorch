@@ -5,11 +5,10 @@ import numpy as np
 
 
 class VideoData:
-    def __init__(self, frames, fps, height, width):
+    def __init__(self, frames, fps):
         self.frames = np.array(frames)
         self.fps = fps
-        self.height = height
-        self.width = width
+        self.height, self.width = self.frames.shape[1:-1]
 
     @property
     def num_frames(self):
@@ -20,7 +19,16 @@ class VideoData:
         return self.height, self.width
 
 
-def read_video(video_path, logger):
+def read_video(video_path, logger, convert_to_rgb=True):
+    """
+    Read a video from a file.
+
+    :param video_path: The path to the video file.
+    :param logger: The `TimedBlock` object used for handling log output.
+    :param convert_to_rgb: Whether to convert the colour channel order to RGB from BGR (this is the default for OpenCV).
+
+    :return: The video wrapped in a `VideoData` object.
+    """
     input_video = cv2.VideoCapture(video_path)
     if not input_video.isOpened():
         raise RuntimeError("Could not open video from the path {}.".format(video_path))
@@ -33,7 +41,9 @@ def read_video(video_path, logger):
         if not has_frame:
             break
 
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if convert_to_rgb:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
         frames.append(frame)
 
         logger.log("Extracted {:,d} video frames.\r".format(len(frames)), end="")
@@ -50,12 +60,13 @@ def read_video(video_path, logger):
     if input_video.isOpened():
         input_video.release()
 
-    return VideoData(frames, fps, height, width)
+    return VideoData(frames, fps)
 
 
-def write_video(frames, video_data, video_output_path, logger):
+def write_video(video_data, video_output_path, logger):
     fourcc = cv2.VideoWriter_fourcc(*"DIVX")
     video_writer = cv2.VideoWriter(video_output_path, fourcc, video_data.fps, (video_data.width, video_data.height))
+    frames = video_data.frames
 
     if frames.shape[-1] == 1:
         warnings.warn("Was given input with one colour channel, stacking frames to get three channels.")

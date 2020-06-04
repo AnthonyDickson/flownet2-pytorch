@@ -17,7 +17,7 @@ from Video3D.align_images import align_images
 from Video3D.colmap_parsing import parse_cameras, parse_images, parse_points
 from Video3D.dataset import OpticalFlowDatasetBuilder, wrap_MiDaS_transform, unwrap_MiDaS_transform
 from Video3D.inference import inference
-from Video3D.io import read_video, write_video
+from Video3D.io import read_video, write_video, VideoData
 from Video3D.training import train
 from models import FlowNet2
 from utils.tools import TimerBlock
@@ -46,7 +46,7 @@ from utils.tools import TimerBlock
     ),
     batch_size=plac.Annotation(
         "The batch size to use for the depth estimation network. Decrease this if you are running out of VRAM",
-        type=str, kind="option"
+        type=int, kind="option"
     )
 )
 def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: str = "model.pt",
@@ -85,7 +85,7 @@ def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: 
         else:
             create_optical_flow_dataset(video_data, colmap_output_path, colmap_cache_path, sparse_depth_map_cache_path,
                                         dnn_depth_map_cache_path, relative_depth_scale_cache_path, dataset_cache_path,
-                                        depth_estimation_model_path, optical_flow_model_path, block)
+                                        depth_estimation_model_path, optical_flow_model_path, block, batch_size)
 
     with TimerBlock("Optimise Depth Estimation Network") as block:
         if os.path.isfile(optimised_dnn_weights_cache_path):
@@ -94,34 +94,29 @@ def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: 
             train(depth_estimation_model_path, optimised_dnn_weights_cache_path, optimised_dnn_checkpoint_cache_path,
                   dataset_cache_path, block, batch_size=batch_size)
 
-    with TimerBlock("Generate Optimised Depth Maps") as block:
-        try:
-            optimised_depth_maps = np.load(optimised_dnn_depth_map_cache_path)
-            block.log("Loaded optimised depth maps from {}.".format(optimised_dnn_depth_map_cache_path))
-        except IOError:
+    if not os.path.isfile(optimised_dnn_depth_map_cache_path):
+        with TimerBlock("Generate Optimised Depth Maps") as block:
             optimised_depth_maps = inference(video_data, optimised_dnn_weights_cache_path, block, batch_size=batch_size)
             block.log("Generated depth maps with optimised network.")
 
             np.save(optimised_dnn_depth_map_cache_path, optimised_depth_maps)
             block.log("Saved optimised depth maps to {}.".format(optimised_dnn_depth_map_cache_path))
 
-    with TimerBlock("Generate Videos") as block:
-        generate_videos(video_data, optimised_depth_maps, dnn_depth_map_cache_path, dnn_depth_video_cache_path,
-                        optimised_dnn_depth_video_cache_path, sample_video_cache_path, block)
+    with TimerBlock("Generate Sample Video") as block:
+        generate_sample_video(video_path, optimised_dnn_depth_map_cache_path, dnn_depth_map_cache_path, sample_video_cache_path, block)
 
 
 def create_optical_flow_dataset(video_data, colmap_output_path, colmap_cache_path, sparse_depth_map_cache_path,
                                 dnn_depth_map_cache_path, relative_depth_scale_cache_path, dataset_cache_path,
-                                depth_estimation_model_path, optical_flow_model_path, logger):
+                                depth_estimation_model_path, optical_flow_model_path, logger, batch_size):
     camera, points2d_by_image, points3d_by_id, poses_by_image = parse_colmap_output(colmap_output_path,
                                                                                     colmap_cache_path, logger)
 
-    relative_depth_scale = calculate_global_scale_adjustment_factor(video_data, camera,
-                                                                    points2d_by_image, points3d_by_id,
-                                                                    depth_estimation_model_path,
+    relative_depth_scale = calculate_global_scale_adjustment_factor(video_data, camera, points2d_by_image,
+                                                                    points3d_by_id, depth_estimation_model_path,
                                                                     dnn_depth_map_cache_path,
                                                                     sparse_depth_map_cache_path,
-                                                                    relative_depth_scale_cache_path, logger)
+                                                                    relative_depth_scale_cache_path, logger, batch_size)
 
     for pose in poses_by_image.values():
         pose.t = relative_depth_scale * pose.t
@@ -276,7 +271,8 @@ def generate_sparse_depth_maps(camera, points2d_by_image, points3d_by_id, logger
 
 def calculate_global_scale_adjustment_factor(video_data, camera, points2d_by_image, points3d_by_id,
                                              depth_estimation_model_path, dnn_depth_map_cache_path,
-                                             sparse_depth_map_cache_path, relative_depth_scale_cache_path, logger):
+                                             sparse_depth_map_cache_path, relative_depth_scale_cache_path, logger,
+                                             batch_size):
     try:
         with open(relative_depth_scale_cache_path, 'rb') as f:
             relative_depth_scale = pickle.load(f)
@@ -287,7 +283,7 @@ def calculate_global_scale_adjustment_factor(video_data, camera, points2d_by_ima
             depth_maps = np.load(dnn_depth_map_cache_path)
             logger.log("Loaded DNN depth maps from {}.".format(dnn_depth_map_cache_path))
         except IOError:
-            depth_maps = inference(video_data, depth_estimation_model_path, logger, batch_size=4).squeeze()
+            depth_maps = inference(video_data, depth_estimation_model_path, logger, batch_size=batch_size).squeeze()
 
             np.save(dnn_depth_map_cache_path, depth_maps)
             logger.log("Saved DNN depth maps to {}.".format(dnn_depth_map_cache_path))
@@ -321,50 +317,60 @@ def sample_frame_pairs(num_frames):
     return frame_pairs
 
 
-def generate_videos(video_data, optimised_depth_maps, dnn_depth_map_cache_path, dnn_depth_video_cache_path,
-                    optimised_dnn_depth_video_cache_path, sample_video_cache_path, logger):
+def generate_sample_video(video_path, optimised_dnn_depth_map_cache_path, dnn_depth_map_cache_path, sample_video_cache_path, logger):
     def scale_depth_volume(x):
-        return (255 * (x - x.min()) / (x.max() - x.min())).to(np.uint8)
+        return (255 * (x - x.min()) / (x.max() - x.min())).astype(np.uint8)
 
-    depth_maps = np.load(dnn_depth_map_cache_path)
-    depth_maps = scale_depth_volume(depth_maps)
+    def load_depth_map(path):
+        x = np.load(path)
+        x = scale_depth_volume(x)
+        x = np.concatenate(3 * [x], axis=-1)
+
+        return x
+
+    if os.path.isfile(sample_video_cache_path):
+        logger.log("Found sample video at {}.".format(video_path))
+        return
+
+    video_data = read_video(video_path, logger, convert_to_rgb=False)
+
+    depth_maps = load_depth_map(dnn_depth_map_cache_path)
     logger.log("Loaded depth maps generated by original model from {}.".format(dnn_depth_map_cache_path))
+
+    optimised_depth_maps = load_depth_map(optimised_dnn_depth_map_cache_path)
+    logger.log("Loaded optimised depth maps from {}.".format(optimised_dnn_depth_map_cache_path))
 
     assert depth_maps.shape == optimised_depth_maps.shape, \
         "Shape of the depth maps do not match. Got {} and {}.".format(depth_maps.shape, optimised_depth_maps.shape)
 
-    logger.log("Creating video of depth maps from original model...")
-    write_video(depth_maps, video_data, dnn_depth_video_cache_path, logger)
+    assert video_data.frames.shape[0] == depth_maps.shape[0], \
+        "Number of video frames and depth maps are not equal. " \
+        "Got {} and {}.".format(video_data.shape[0], depth_maps.shape[0])
 
-    logger.log("Creating video of depth maps from optimised model...")
-    optimised_depth_maps = scale_depth_volume(optimised_depth_maps)
-    write_video(optimised_depth_maps, video_data, optimised_dnn_depth_video_cache_path, logger)
+    assert video_data.frames.shape[-1] == depth_maps.shape[-1], \
+        "Number channels for the video and depth maps are not equal. " \
+        "Got {} and {}.".format(video_data.shape[-1], depth_maps.shape[-1])
 
-    logger.log("Creating video of inputs and all depth maps stacked horizontally...")
-
-    if video_data.frames.shape[:-1] != depth_maps.shape[:-1]:
+    if video_data.frames.shape[1:-1] != depth_maps.shape[1:-1]:
         warnings.warn(
             "Video spatial dimensions did not match the spatial dimensions of the depth maps. "
-            "Got {video} shaped video frames and {depth} for the depth maps. "
+            "Got {video} shaped video frames and {depth} shaped depth maps. "
             "Resizing the video frames to {depth}.".format(video=video_data.frames.shape[1:-1],
                                                            depth=depth_maps.shape[1:-1])
         )
 
+        height, width = depth_maps.shape[1:-1]
+
         frames = F.interpolate(torch.from_numpy(video_data.frames),
-                               size=(video_data.height, video_data.width), mode="bilinear", align_corners=True)
+                               size=(height, width), mode="bilinear", align_corners=True)
         frames = frames.numpy()
     else:
         frames = video_data.frames
 
-    sample_video_frames = np.stack(
-        (
-            frames,
-            np.stack(3 * [depth_maps], axis=-1),
-            np.stack(3 * [optimised_depth_maps], axis=-1)
-        ),
-        axis=-2
-    )
-    write_video(sample_video_frames, video_data, sample_video_cache_path, logger)
+    sample_video_frames = np.concatenate((frames, depth_maps, optimised_depth_maps), axis=-2)
+    logger.log("Stacked video frames and depth maps. Stacked video shape (NHWC): {}.".format(sample_video_frames.shape))
+
+    write_video(VideoData(sample_video_frames, video_data.fps), sample_video_cache_path, logger)
 
 
 if __name__ == '__main__':

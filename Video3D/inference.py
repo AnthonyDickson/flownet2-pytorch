@@ -51,14 +51,15 @@ def inference(video_data, model_path, logger, scale_output=False, batch_size=8):
     video_path=plac.Annotation("The path to the input video.", kind="option", type=str, abbrev="i"),
     model_path=plac.Annotation("The path to the depth estimation model weights.", kind="option", type=str, abbrev="m"),
     video_output_path=plac.Annotation("The path to the write the output to.", kind="option", type=str, abbrev="o"),
+    batch_size=plac.Annotation("The mini-batch size to use for the depth estimation network.", kind="option", type=int),
 )
-def main(video_path, model_path, video_output_path):
+def main(video_path, model_path, video_output_path, batch_size=8):
     with TimerBlock("Load Video") as block:
         video_data = read_video(video_path, block)
 
     with TimerBlock("Depth Estimation") as block:
-        depth_maps = inference(video_data, model_path, block, scale_output=True, batch_size=4)
-        write_video(depth_maps, video_data, video_output_path, block)
+        depth_maps = inference(video_data, model_path, block, scale_output=True, batch_size=batch_size)
+        write_video(VideoData(depth_maps, video_data.fps), video_output_path, block)
 
 
 if __name__ == '__main__':
