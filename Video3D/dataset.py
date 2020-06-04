@@ -119,6 +119,7 @@ class OpticalFlowDatasetBuilder:
     to call the `finalise()` method when you're finished making changes to the dataset to make sure the dataset's
     metadata is saved properly.
     """
+
     def __init__(self, base_dir: str, camera: Camera):
         assert os.path.isdir(base_dir), "Could not find or access the path {}.".format(base_dir)
 
@@ -279,23 +280,31 @@ def unwrap_MiDaS_transform(x):
     return x["image"]
 
 
-def create_image_transform(height, width):
-    transform = Compose(
-        [
-            wrap_MiDaS_transform,
-            Resize(
-                width,
-                height,
-                resize_target=None,
-                keep_aspect_ratio=True,
-                ensure_multiple_of=32,
-                resize_method="upper_bound",
-                image_interpolation_method=cv2.INTER_CUBIC,
-            ),
-            NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            PrepareForNet(),
-            unwrap_MiDaS_transform
-        ]
-    )
+def scale(x):
+    return x / 255.0
 
-    return transform
+
+def create_image_transform(height, width, normalise=True):
+    transforms = [
+        scale,
+        wrap_MiDaS_transform,
+        Resize(
+            width,
+            height,
+            resize_target=None,
+            keep_aspect_ratio=True,
+            ensure_multiple_of=32,
+            resize_method="upper_bound",
+            image_interpolation_method=cv2.INTER_CUBIC,
+        ),
+    ]
+
+    if normalise:
+        transforms.append(NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
+
+    transforms += [
+        PrepareForNet(),
+        unwrap_MiDaS_transform
+    ]
+
+    return Compose(transforms)

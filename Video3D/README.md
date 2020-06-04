@@ -2,6 +2,7 @@
 This package implements the paper "Consistent Video Depth Estimation" [1]. 
 For the monocular depth estimation network I use MiDaS [2]. This project also relies on FlowNet2 [3] and I use a public 
 PyTorch implementation [4].
+
 ## Program Pipeline Overview
 1.  Take video.
 2.  Run reconstruction algorithm on video with COLMAP.
@@ -16,16 +17,31 @@ PyTorch implementation [4].
     3.  Filter frame pairs based on the consistency of the optical flow.
 9.  Create a dataset from the frame pairs and optical flow fields.
 10. Perform test-time training on the monocular depth estimation network.
-11. [TODO] Generate depth maps for the video using the trained network. 
+11. Generate depth maps for the video using the trained network. 
 
 ## Getting Started
-1.  Get the docker container running. See [INSTALL.md](../INSTALL.md) for more details.
-2.  Start the docker container using [launch_docker.sh](../launch_docker.sh).
-3.  Run the main script. Run `python3 -m Video3D -h` for help on the command line arguments.
+1.  Setup the depth estimation model: 
+    1.  Clone my fork of the [MiDaS repository](https://github.com/eight0153/MiDaS.git) into the project root folder and checkout the `video3d` branch:
+        ```shell script
+        git clone https://github.com/eight0153/MiDaS.git
+        git checkout --track origin/video3d
+        ```
+    2.  Download the pretrained model weights (link is in the README.md).
+2.  Get the docker container running. See [INSTALL.md](../INSTALL.md) for more details.
+3.  Start the docker container using [launch_docker.sh](../launch_docker.sh).
+4.  Run the main script. Run `python3 -m Video3D -h` for help on the command line arguments.
     - Example command: `python3 -m Video3D data/asakusa_29fps/colmap/ -i data/asakusa_29fps/source.webm -d checkpoints/model.pt -f checkpoints/FlowNet2_checkpoint.pth.tar`
 
 ### Caching
 By default, the script will cache intermediate results since they are usually too large to fit in memory. You can clear the cache if need be by simply removing the cache folder: `rm -r .cache/`.
+
+## TODO
+-   Automate extraction of video frames.
+-   Automate COLMAP reconstruction.
+-   Read binary COLMAP output from Python code.
+-   Generate examples of frame pairs and optical flow automatically.
+-   Visualise examples of optical flow with vector field.
+-   Generate sample video with input, original depth maps and the optimised depths stacked horizontally.
 ## References
 1. Luo, Xuan, Jia-Bin Huang, Richard Szeliski, Kevin Matzen, and Johannes Kopf. "Consistent Video Depth Estimation." arXiv preprint arXiv:2004.15021 (2020).
 2. Lasinger, Katrin, René Ranftl, Konrad Schindler, and Vladlen Koltun. "Towards robust monocular depth estimation: Mixing datasets for zero-shot cross-dataset transfer." arXiv preprint arXiv:1907.01341 (2019). https://github.com/intel-isl/MiDaS

@@ -250,6 +250,7 @@ def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: 
     dataset_cache_path = os.path.join(cache_path, "dataset")
     optimised_dnn_weights_cache_path = os.path.join(cache_path, "optimised_depth_estimation_model.pt")
     optimised_dnn_checkpoint_cache_path = os.path.join(cache_path, "depth_estimation_model_checkpoint.pt")
+    optimised_dnn_depth_map_cache_path = os.path.join(cache_path, "optimised_dnn_depth_map.npy")
 
     with TimerBlock("Load Video") as block:
         video_data = read_video(video_path, block)
@@ -295,6 +296,9 @@ def main(colmap_output_path: str, video_path: str, depth_estimation_model_path: 
         depth_maps = inference(video_data, optimised_dnn_weights_cache_path, block, scale_output=True, batch_size=4)
         write_video(depth_maps, video_data, "output-after.avi", block)
         block.log("Generated depth maps with optimised network.")
+
+        np.save(optimised_dnn_depth_map_cache_path, depth_maps)
+        block.log("Saved optimised depth maps to {}.".format(optimised_dnn_depth_map_cache_path))
 
 
 if __name__ == '__main__':
