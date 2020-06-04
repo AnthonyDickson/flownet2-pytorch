@@ -11,3 +11,4 @@ data/
 output/
 checkpoints/
 .cache/
+workspace/

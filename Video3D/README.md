@@ -41,7 +41,6 @@ By default, the script will cache intermediate results since they are usually to
 -   Read binary COLMAP output from Python code.
 -   Generate examples of frame pairs and optical flow automatically.
 -   Visualise examples of optical flow with vector field.
--   Generate sample video with input, original depth maps and the optimised depths stacked horizontally.
 ## References
 1. Luo, Xuan, Jia-Bin Huang, Richard Szeliski, Kevin Matzen, and Johannes Kopf. "Consistent Video Depth Estimation." arXiv preprint arXiv:2004.15021 (2020).
 2. Lasinger, Katrin, René Ranftl, Konrad Schindler, and Vladlen Koltun. "Towards robust monocular depth estimation: Mixing datasets for zero-shot cross-dataset transfer." arXiv preprint arXiv:1907.01341 (2019). https://github.com/intel-isl/MiDaS

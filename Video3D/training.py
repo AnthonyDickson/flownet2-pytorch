@@ -39,7 +39,8 @@ class RunningAverage:
 
 @plac.annotations(
     model_path=plac.Annotation("The path to the pretrained model weights.", type=str, kind="option", abbrev="m"),
-    best_weights_path=plac.Annotation("The path to the save the best model weights.", type=str, kind="option", abbrev="b"),
+    best_weights_path=plac.Annotation("The path to the save the best model weights.", type=str, kind="option",
+                                      abbrev="b"),
     checkpoint_path=plac.Annotation("The path to the save the model checkpoints.", type=str, kind="option", abbrev="c"),
     dataset_path=plac.Annotation("The path to the frame pair and optical flow dataset.", type=str, kind="option",
                                  abbrev="d"),
@@ -50,7 +51,7 @@ class RunningAverage:
                                           type=float, kind="option"),
 )
 def train(model_path, best_weights_path, checkpoint_path, dataset_path, logger=None,
-          num_epochs=20, batch_size=4, lr=0.0004, balancing_coefficient=0.1):
+          num_epochs=20, batch_size=8, lr=0.0004, balancing_coefficient=0.1):
     close_logger_on_exit = False
 
     if logger is None:
@@ -125,7 +126,7 @@ def train(model_path, best_weights_path, checkpoint_path, dataset_path, logger=N
                 c_i = depth_i[batch_i] * torch.tensordot(K_inverse, x_, dims=1)
                 c_ij = torch.tensordot(torch.transpose(R_j[batch_i], 0, 1),
                                        torch.tensordot(R_i[batch_i], c_i, dims=1) + (
-                                                   t_i[batch_i] - t_j[batch_i]).unsqueeze(-1), dims=1)
+                                               t_i[batch_i] - t_j[batch_i]).unsqueeze(-1), dims=1)
 
                 c_ij_homogeneous = torch.ones(size=(4, *c_ij.shape[1:]), dtype=c_ij.dtype, device=c_ij.device)
                 c_ij_homogeneous[:-1] = c_ij
@@ -149,11 +150,11 @@ def train(model_path, best_weights_path, checkpoint_path, dataset_path, logger=N
 
             epoch_progress += batch_size
             epoch_loss.update(weighted_loss.item(), num_valid_pixels.item())
-            logger.log("Epoch Progress: {:04d}/{:04d} - Loss {:.4f} (Epoch Avg.: {:.4f})\r".format(epoch_progress,
-                                                                                                   len(flow_dataset),
-                                                                                                   loss.item(),
-                                                                                                   epoch_loss.value),
-                       end="")
+            logger.log(
+                "Epoch Progress: {:04d}/{:04d} - Loss {:.4f} (Epoch Avg.: {:.4f})          \r"
+                    .format(epoch_progress, len(flow_dataset), loss.item(), epoch_loss.value)
+                , end=""
+            )
 
         print()
 
