@@ -25,13 +25,25 @@ PyTorch implementation [4].
 - [TODO] Generate per-frame triangle meshes.  
 
 ## Getting Started
-1.  Setup the depth estimation model: 
-    1.  Clone my fork of the [MiDaS repository](https://github.com/eight0153/MiDaS.git) into the project root folder and checkout the `video3d` branch:
+1.  Setup the depth estimation models: 
+    1.  Create a directory called `checkpoints` in the root project folder.
+    2.  Clone my fork of the [MiDaS repository](https://github.com/eight0153/MiDaS.git) into the project root folder and checkout the `video3d` branch:
         ```shell script
         git clone https://github.com/eight0153/MiDaS.git
         git checkout --track origin/video3d
         ```
-    2.  Download the pretrained model weights (link is in the README.md).
+    3.  Download the pretrained model weights (link is in the README.md) and place the file(s) in the `checkpoints/` folder.
+    4.  Clone my fork of the [Mannequin Challenge Code and Trained Models](https://github.com/eight0153/mannequinchallenge.git) into the project root folder:
+        ```shell script
+        git clone https://github.com/eight0153/mannequinchallenge.git
+        ```
+    5.  Download the model weights using the script `fetch_checkpoints.sh` and copy them to the `checkpoints/` folder:
+        ```shell script
+        cd mannequinchallenge
+        ./fetch_checkpoints.sh
+        cp -r checkpoints/* ..checkpoints
+        cd ..
+        ```
 2.  Get the docker container running. See [INSTALL.md](../INSTALL.md) for more details.
 3.  Start the docker container using [launch_docker.sh](../launch_docker.sh).
 4.  Run the main script. Run `python3 -m Video3D -h` for help on the command line arguments.
@@ -49,6 +61,7 @@ By default, the script will cache intermediate results since they are usually to
 -   Visualise examples of optical flow with vector field.
 -   Create point clouds for each frame and each depth estimation model (before and after).
 -   Create 3D mesh from point clouds.
+-   Create environment.yml for the project so that everything except FlowNet2 can be run locally without Docker.
 
 ## References
 1. Luo, Xuan, Jia-Bin Huang, Richard Szeliski, Kevin Matzen, and Johannes Kopf. "Consistent Video Depth Estimation." arXiv preprint arXiv:2004.15021 (2020).
