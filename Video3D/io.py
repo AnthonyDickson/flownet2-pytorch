@@ -10,6 +10,12 @@ class VideoData:
         self.fps = fps
         self.height, self.width = self.frames.shape[-2:] if self.is_nchw else self.frames.shape[1:-1]
 
+    def __iter__(self):
+        return iter(self.frames)
+
+    def __len__(self):
+        return len(self.frames)
+
     @property
     def num_frames(self):
         return len(self.frames)
@@ -28,7 +34,7 @@ class VideoData:
         else:
             return VideoData(self.frames.transpose((0, 3, 1, 2)), self.fps)
 
-
+# TODO: Refactor this method to be a static member of the VideoData class.
 def read_video(video_path, logger, convert_to_rgb=True):
     """
     Read a video from a file.
