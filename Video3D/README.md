@@ -41,7 +41,7 @@ PyTorch implementation [4].
         ```shell script
         cd mannequinchallenge
         ./fetch_checkpoints.sh
-        cp -r checkpoints/* ..checkpoints
+        cp -r checkpoints/* ../checkpoints
         cd ..
         ```
 2.  Get the docker container running. See [INSTALL.md](../INSTALL.md) for more details.
@@ -49,17 +49,12 @@ PyTorch implementation [4].
 4.  Run the main script. Run `python3 -m Video3D -h` for help on the command line arguments.
     - Example command: `python3 -m Video3D data/asakusa_29fps/colmap/ -i data/asakusa_29fps/source.webm -d checkpoints/model.pt -f checkpoints/FlowNet2_checkpoint.pth.tar`
 
-### Caching
-By default, the script will cache intermediate results since they are usually too large to fit in memory. You can clear the cache if need be by simply removing the cache folder: `rm -r .cache/`.
-
 ## TODO
 -   Automate creation of folders etc.
 -   Automate extraction of video frames.
 -   Automate COLMAP reconstruction.
--   Read binary COLMAP output from Python code.
 -   Generate examples of frame pairs and optical flow automatically.
 -   Visualise examples of optical flow with vector field.
--   Create point clouds for each frame and each depth estimation model (before and after).
 -   Create 3D mesh from point clouds.
 -   Create environment.yml for the project so that everything except FlowNet2 can be run locally without Docker.
 

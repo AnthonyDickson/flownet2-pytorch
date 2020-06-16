@@ -2,7 +2,7 @@
 1.  Ensure NVIDIA GPU drivers are installed - `nvidia-smi` is the quickest way to check.
 2.  Install Docker.
 3.  Install [nvidia-docker](https://github.com/NVIDIA/nvidia-docker).
-4.  Download checkpoint file(s) from the links listed in the [README file](README.md).
+4.  Download checkpoint file(s) from the links listed in the [README file](README.md) (Just the first one, "FlowNet2", is necessary). 
 5.  Run `./launch_docker.sh` to build the Docker image and launch the Docker container.
 6.  Run `./install.sh` from within Docker container to install the custom neural network layers.
 7.  You can now run the code. 

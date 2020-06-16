@@ -8,7 +8,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from MiDaS.models.midas_net import MidasNet
-from Video3D.colmap_parsing import Camera
+from Video3D.colmap_io import Camera
 from Video3D.dataset import OpticalFlowDataset, create_image_transform
 from mannequinchallenge.models import pix2pix_model
 from utils.tools import TimerBlock

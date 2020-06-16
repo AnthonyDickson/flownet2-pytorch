@@ -10,7 +10,7 @@ from torch.utils.data import Dataset
 from torchvision.transforms import Compose
 
 from MiDaS.models.transforms import Resize, NormalizeImage, PrepareForNet
-from Video3D.colmap_parsing import Camera, CameraPose
+from Video3D.colmap_io import Camera, CameraPose, Image
 
 
 class OpticalFlowDataMetadata:
@@ -136,22 +136,22 @@ class OpticalFlowDatasetBuilder:
         for dir_name in (self.frame_data_dir, self.optical_flow_dir):
             os.makedirs(dir_name)
 
-    def add(self, i, j, frame_i, frame_j, optical_flow_field, valid_mask, camera_poses):
+    def add(self, i, j, frame_i, frame_j, optical_flow_field, valid_mask, images):
         assert frame_i.shape[:2] == frame_j.shape[:2] == optical_flow_field.shape[-2:] == valid_mask.shape[-2:], \
             "The frames, optical flow field and optical flow mask must all have the same spatial dimensions. " \
             "Got {}, {}, {} and {}." \
                 .format(frame_i.shape[:2], frame_j.shape[:2], optical_flow_field.shape[:2], valid_mask.shape[:2])
 
-        if i not in camera_poses or j not in camera_poses:
+        if i not in images or j not in images:
             warnings.warn("A frame pair was found where there was no camera pose given (frame indices: {}, {}), "
                           "skipping frame pair.".format(i, j))
             return
 
-        self._add_frame(i, frame_i, camera_poses[i])
-        self._add_frame(j, frame_j, camera_poses[j])
+        self._add_frame(i, frame_i, images[i])
+        self._add_frame(j, frame_j, images[j])
         self._add_optical_flow(i, j, optical_flow_field, valid_mask)
 
-    def _add_frame(self, frame_index, frame, camera_pose: CameraPose):
+    def _add_frame(self, frame_index, frame, image: Image):
         if frame_index not in self.metadata.frame_paths:
             frame_filename = "{:04d}.png".format(frame_index)
             pose_filename = "{:04d}.pkl".format(frame_index)
@@ -160,7 +160,7 @@ class OpticalFlowDatasetBuilder:
             pose_path = os.path.join(self.frame_data_dir, pose_filename)
 
             cv2.imwrite(frame_path, frame)
-            camera_pose.save_pkl(pose_path)
+            image.camera_pose.save_pkl(pose_path)
 
             self.metadata.add_frame(frame_index, frame_filename, pose_filename)
 

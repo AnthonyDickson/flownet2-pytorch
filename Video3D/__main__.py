@@ -16,9 +16,9 @@ from torchvision.transforms import Compose
 
 from MiDaS.models.transforms import Resize
 from Video3D.align_images import align_images
-from Video3D.colmap_parsing import parse_cameras, parse_images, parse_points
+from Video3D.colmap_io import read_model
 from Video3D.dataset import OpticalFlowDatasetBuilder, wrap_MiDaS_transform, unwrap_MiDaS_transform
-from Video3D.inference import inference_li, inference
+from Video3D.inference import inference_li, inference_lasinger, create_and_save_depth
 from Video3D.io import read_video
 from Video3D.training import train, train_li
 from models import FlowNet2
@@ -93,7 +93,7 @@ def main(colmap_output_path: str, video_path: str, checkpoint_path: str = "check
         inference_fn = inference_li
     elif depth_estimation_model == "lasinger":
         train_fn = train
-        inference_fn = inference
+        inference_fn = inference_lasinger
     else:
         raise RuntimeError("Unsupported depth estimation model: {}.".format(depth_estimation_model))
 
@@ -118,24 +118,15 @@ def main(colmap_output_path: str, video_path: str, checkpoint_path: str = "check
 
     if not os.path.isfile(dnn_depth_map_path):
         with TimerBlock("Generate Depth Maps") as block:
-            depth_maps = inference_li(video_data, depth_estimation_model_path, block, batch_size=batch_size)
+            create_and_save_depth(inference_fn, video_data, depth_estimation_model_path, dnn_depth_map_path, logger=block, batch_size=batch_size)
             block.log("Generated depth maps with pretrained network.")
-
-            np.save(dnn_depth_map_path, depth_maps)
             block.log("Saved depth maps to {}.".format(dnn_depth_map_path))
-
-            del depth_maps
 
     if not os.path.isfile(optimised_dnn_depth_map_path):
         with TimerBlock("Generate Optimised Depth Maps") as block:
-            optimised_depth_maps = inference_fn(video_data, optimised_depth_estimation_model_path, block,
-                                                batch_size=batch_size)
+            create_and_save_depth(inference_fn, video_data, optimised_depth_estimation_model_path, optimised_dnn_depth_map_path, logger=block, batch_size=batch_size)
             block.log("Generated depth maps with optimised network.")
-
-            np.save(optimised_dnn_depth_map_path, optimised_depth_maps)
-            block.log("Saved optimised depth maps to {}.".format(optimised_dnn_depth_map_path))
-
-            del optimised_depth_maps
+            block.log("Saved depth maps to {}.".format(optimised_dnn_depth_map_path))
 
     with TimerBlock("Generate Sample Video") as block:
         generate_sample_video(video_path, dnn_depth_map_path, optimised_dnn_depth_map_path, sample_video_path, block)
@@ -145,18 +136,17 @@ def create_optical_flow_dataset(video_data, colmap_output_path, colmap_path, spa
                                 dnn_depth_map_path, relative_depth_scale_path, dataset_path,
                                 depth_estimation_model_path, optical_flow_model_path, logger,
                                 inference_fn, batch_size):
-    camera, points2d_by_image, points3d_by_id, poses_by_image = parse_colmap_output(colmap_output_path,
-                                                                                    colmap_path, logger)
+    camera, images_by_id, points3d_by_id = parse_colmap_output(colmap_output_path, colmap_path, logger)
 
-    relative_depth_scale = calculate_global_scale_adjustment_factor(video_data, camera, points2d_by_image,
+    relative_depth_scale = calculate_global_scale_adjustment_factor(video_data, camera, images_by_id,
                                                                     points3d_by_id, depth_estimation_model_path,
                                                                     dnn_depth_map_path,
                                                                     sparse_depth_map_path,
                                                                     relative_depth_scale_path, logger,
                                                                     inference_fn, batch_size)
 
-    for pose in poses_by_image.values():
-        pose.t = relative_depth_scale * pose.t
+    for image in images_by_id.values():
+        image.camera_pose.t = relative_depth_scale * image.camera_pose.t
 
     logger.log("Scaled the translation component of the camera poses by the relative scale factor of {:.2f}"
                .format(relative_depth_scale))
@@ -237,7 +227,7 @@ def create_optical_flow_dataset(video_data, colmap_output_path, colmap_path, spa
             should_keep_frame = np.mean(valid_mask) >= 0.8
 
             if should_keep_frame:
-                dataset_builder.add(i, j, frame_i, frame_j, optical_flow_forwards, valid_mask, poses_by_image)
+                dataset_builder.add(i, j, frame_i, frame_j, optical_flow_forwards, valid_mask, images_by_id)
             else:
                 num_filtered += 1
 
@@ -251,49 +241,42 @@ def create_optical_flow_dataset(video_data, colmap_output_path, colmap_path, spa
 def parse_colmap_output(colmap_output_path, colmap_path, logger):
     try:
         with open(colmap_path, 'rb') as f:
-            camera, poses_by_image, points2d_by_image, points3d_by_id = pickle.load(f)
+            camera, images, points3D = pickle.load(f)
 
         logger.log("Loaded parsed COLMAP output from {}.".format(colmap_path))
     except FileNotFoundError:
-        cameras_txt = os.path.join(colmap_output_path, "cameras.txt")
-        images_txt = os.path.join(colmap_output_path, "images.txt")
-        points_3d_txt = os.path.join(colmap_output_path, "points3D.txt")
+        cameras, images, points3D = read_model(
+            os.path.join(colmap_output_path, "sparse/0"),
+            ".bin"
+        )
+        logger.log("Loaded raw COLMAP output from {}.".format(colmap_output_path))
 
-        camera = parse_cameras(cameras_txt)[0]
-        logger.log("Parsed camera intrinsics.")
-
-        poses_by_image, points2d_by_image = parse_images(images_txt)
-        logger.log("Parsed camera poses and 2D points.")
-
-        points3d_by_id = parse_points(points_3d_txt)
-        logger.log("Parsed 3D points.")
+        # Assume there is only one camera. Sometimes COLMAP can give multiple cameras I think?
+        camera = list(cameras.values())[0]
 
         with open(colmap_path, 'wb') as f:
-            pickle.dump((camera, poses_by_image, points2d_by_image, points3d_by_id), f)
+            pickle.dump((camera, images, points3D), f)
 
         logger.log("Saved parsed COLMAP output to {}.".format(colmap_path))
-    return camera, points2d_by_image, points3d_by_id, poses_by_image
+
+    return camera, images, points3D
 
 
-def generate_sparse_depth_maps(camera, points2d_by_image, points3d_by_id, logger, sparse_depth_map_path):
+def generate_sparse_depth_maps(camera, images_by_id, points3d_by_id, logger, sparse_depth_map_path):
     try:
         sparse_depth_maps = np.load(sparse_depth_map_path)
         logger.log("Loaded sparse depth maps from {}.".format(sparse_depth_map_path))
     except IOError:
-        sparse_depth_maps = []
+        num_frames = len(images_by_id)
+        sparse_depth_maps = np.zeros(shape=(num_frames, *camera.shape), dtype=np.float32)
+        height, width = camera.shape
 
-        num_frames = len(points2d_by_image)
-
-        for points in points2d_by_image.values():
-            depth_map = np.zeros(shape=camera.shape, dtype=np.float32)
-
-            for point in points:
-                if point.point3d_id > -1 and point.x <= depth_map.shape[1] and point.y <= depth_map.shape[0]:
+        for image in images_by_id.values():
+            for point in image.points2D:
+                if point.point3d_id > -1 and point.x <= width and point.y <= height:
                     point3d = points3d_by_id[point.point3d_id]
-
-                    depth_map[int(point.y), int(point.x)] = point3d.z
-
-            sparse_depth_maps.append(depth_map)
+                    # TODO: Fix index out of bounds error with image.id. Off by one error? I think the image ids are one-based.
+                    sparse_depth_maps[image.id, int(point.y), int(point.x)] = point3d.z
 
             logger.log("Generated {}/{} sparse depth maps.\r".format(len(sparse_depth_maps), num_frames), end="")
 
@@ -307,7 +290,7 @@ def generate_sparse_depth_maps(camera, points2d_by_image, points3d_by_id, logger
     return sparse_depth_maps
 
 
-def calculate_global_scale_adjustment_factor(video_data, camera, points2d_by_image, points3d_by_id,
+def calculate_global_scale_adjustment_factor(video_data, camera, images_by_id, points3d_by_id,
                                              depth_estimation_model_path, dnn_depth_map_path,
                                              sparse_depth_map_path, relative_depth_scale_path, logger,
                                              inference_fn, batch_size):
@@ -321,12 +304,11 @@ def calculate_global_scale_adjustment_factor(video_data, camera, points2d_by_ima
             depth_maps = np.load(dnn_depth_map_path)
             logger.log("Loaded DNN depth maps from {}.".format(dnn_depth_map_path))
         except IOError:
-            depth_maps = inference_fn(video_data, depth_estimation_model_path, logger, batch_size=batch_size)
+            depth_maps = create_and_save_depth(inference_fn, video_data, depth_estimation_model_path, dnn_depth_map_path, logger, batch_size)
 
-            np.save(dnn_depth_map_path, depth_maps)
             logger.log("Saved DNN depth maps to {}.".format(dnn_depth_map_path))
 
-        sparse_depth_maps = generate_sparse_depth_maps(camera, points2d_by_image, points3d_by_id, logger,
+        sparse_depth_maps = generate_sparse_depth_maps(camera, images_by_id, points3d_by_id, logger,
                                                        sparse_depth_map_path)
 
         zero_mask = sparse_depth_maps == 0

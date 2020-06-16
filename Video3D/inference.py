@@ -1,7 +1,10 @@
 import argparse
+import os
 
+import numpy as np
 import plac
 import torch
+from numpy.lib.format import open_memmap
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
@@ -12,7 +15,7 @@ from mannequinchallenge.models import pix2pix_model
 from utils.tools import TimerBlock
 
 
-def inference(video_data, model_path, logger, scale_output=False, batch_size=8):
+def inference_lasinger(video_data, model_path, logger, batch_size=8):
     model = MidasNet(model_path, non_negative=False)
     model = model.cuda()
     model.eval()
@@ -25,14 +28,13 @@ def inference(video_data, model_path, logger, scale_output=False, batch_size=8):
 
     with torch.no_grad():
         num_frames_processed = 0
-        depth_maps = []
 
         for batch_i, batch in enumerate(data_loader):
             images = batch.cuda()
             depth = model(images)
             depth = F.interpolate(depth.unsqueeze(1), size=(video_data.height, video_data.width), mode='bilinear',
                                   align_corners=True)
-            depth_maps.append(depth.detach().cpu())
+            yield depth.detach().cpu().numpy()
 
             num_frames_processed += images.shape[0]
 
@@ -40,18 +42,9 @@ def inference(video_data, model_path, logger, scale_output=False, batch_size=8):
 
     print()
 
-    depth_maps = torch.cat(depth_maps, dim=0)
-
-    if scale_output:
-        depth_maps = (255 * (depth_maps - depth_maps.min()) / (depth_maps.max() - depth_maps.min())).to(torch.uint8)
-
-    depth_maps = depth_maps.numpy()
-
-    return depth_maps
-
 
 # TODO: Make inference code DRY.
-def inference_li(video_data, model_path, logger, scale_output=False, batch_size=8):
+def inference_li(video_data, model_path, logger, batch_size=8):
     opt = argparse.Namespace(input='single_view', mode='Ours_Bilinear',
                              checkpoints_dir='', name='', isTrain=True,
                              gpu_ids='0', lr=0.0004, lr_policy='step', lr_decay_epoch=8)
@@ -73,7 +66,6 @@ def inference_li(video_data, model_path, logger, scale_output=False, batch_size=
 
     with torch.no_grad():
         num_frames_processed = 0
-        depth_maps = []
 
         for batch_i, batch in enumerate(data_loader):
             images = batch.cuda()
@@ -81,7 +73,7 @@ def inference_li(video_data, model_path, logger, scale_output=False, batch_size=
             depth, _ = model.netG(images)
             depth = F.interpolate(depth, size=(video_data.height, video_data.width), mode='bilinear',
                                   align_corners=True)
-            depth_maps.append(depth.detach().cpu())
+            yield depth.detach().cpu().numpy()
 
             num_frames_processed += images.shape[0]
 
@@ -89,12 +81,26 @@ def inference_li(video_data, model_path, logger, scale_output=False, batch_size=
 
     print()
 
-    depth_maps = torch.cat(depth_maps, dim=0)
 
-    if scale_output:
-        depth_maps = (255 * (depth_maps - depth_maps.min()) / (depth_maps.max() - depth_maps.min())).to(torch.uint8)
+def create_and_save_depth(inference_fn, video_data, depth_estimation_model_path, dnn_depth_map_path, logger, batch_size):
+    depth_maps = open_memmap(
+        filename=dnn_depth_map_path,
+        dtype=np.float32,
+        mode='w+',
+        shape=(video_data.num_frames, 1, *video_data.shape)
+    )
 
-    depth_maps = depth_maps.numpy()
+    for batch_i, depth_map in enumerate(inference_fn(video_data, depth_estimation_model_path, logger, batch_size=batch_size)):
+        batch_start_idx = batch_size * batch_i
+        # Sometimes the last batch is a different size to the rest, so we need to use the actual batch size rather than
+        # the specified one.
+        current_batch_size = depth_map.shape[0]
+        batch_end_idx = batch_start_idx + current_batch_size
+        depth_maps[batch_start_idx:batch_end_idx] = depth_map
+
+    depth_maps.flush()
+
+    logger.log("Saved DNN depth maps to {}.".format(dnn_depth_map_path))
 
     return depth_maps
 
@@ -110,7 +116,12 @@ def main(video_path, model_path, video_output_path, batch_size=8):
         video_data = read_video(video_path, block)
 
     with TimerBlock("Depth Estimation") as block:
-        depth_maps = inference_li(video_data, model_path, block, scale_output=True, batch_size=batch_size)
+        tmp_dir = ".tmp"
+        os.makedirs(tmp_dir, exist_ok=True)
+        depth_map_path = os.path.join(tmp_dir, "inference_depth_maps.npy")
+
+        depth_maps = create_and_save_depth(inference_li, video_data, model_path, depth_map_path, block, batch_size=batch_size)
+        depth_maps = (255 * (depth_maps - depth_maps.min()) / (depth_maps.max() - depth_maps.min())).to(torch.uint8)
         write_video(VideoData(depth_maps, video_data.fps), video_output_path, block)
 
 

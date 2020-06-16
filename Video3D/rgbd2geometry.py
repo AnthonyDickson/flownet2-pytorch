@@ -117,7 +117,7 @@ def main(video_path, workspace_path="workspace"):
         block.log("Loaded optimised depth maps from {}.".format(optimised_dnn_depth_map_path))
 
         with open(colmap_path, 'rb') as f:
-            camera, _, _, _ = pickle.load(f)
+            camera, _, _ = pickle.load(f)
 
         block.log("Loaded camera intrinsics from {}.".format(colmap_path))
 
