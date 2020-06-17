@@ -1,7 +1,10 @@
 import warnings
+from typing import Optional
 
 import cv2
 import numpy as np
+
+from utils.tools import TimerBlock
 
 
 class VideoData:
@@ -35,7 +38,7 @@ class VideoData:
             return VideoData(self.frames.transpose((0, 3, 1, 2)), self.fps)
 
 # TODO: Refactor this method to be a static member of the VideoData class.
-def read_video(video_path, logger, convert_to_rgb=True):
+def read_video(video_path, logger: Optional[TimerBlock] = None, convert_to_rgb=True):
     """
     Read a video from a file.
 
@@ -45,10 +48,20 @@ def read_video(video_path, logger, convert_to_rgb=True):
 
     :return: The video wrapped in a `VideoData` object.
     """
+    close_logger_on_exit = False
+
+    if logger is None:
+        logger = TimerBlock("Reading Video")
+        logger.__enter__()
+        close_logger_on_exit = True
+
     input_video = cv2.VideoCapture(video_path)
+
     if not input_video.isOpened():
         raise RuntimeError("Could not open video from the path {}.".format(video_path))
+
     logger.log("Opened video from the path {}.".format(video_path))
+
     frames = []
 
     while input_video.isOpened():
@@ -76,10 +89,20 @@ def read_video(video_path, logger, convert_to_rgb=True):
     if input_video.isOpened():
         input_video.release()
 
+    if close_logger_on_exit:
+        logger.__exit__(None, None, None)
+
     return VideoData(frames, fps)
 
 
-def write_video(video_data, video_output_path, logger):
+def write_video(video_data, video_output_path, logger: Optional[TimerBlock] = None):
+    close_logger_on_exit = False
+
+    if logger is None:
+        logger = TimerBlock("Writing Video")
+        logger.__enter__()
+        close_logger_on_exit = True
+
     fourcc = cv2.VideoWriter_fourcc(*"DIVX")
     video_writer = cv2.VideoWriter(video_output_path, fourcc, video_data.fps, (video_data.width, video_data.height))
     frames = video_data.frames
@@ -100,3 +123,6 @@ def write_video(video_data, video_output_path, logger):
 
     video_writer.release()
     logger.log("Wrote video to {}.".format(video_output_path))
+
+    if close_logger_on_exit:
+        logger.__exit__(None, None, None)

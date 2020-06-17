@@ -51,8 +51,8 @@ class RunningAverage:
     balancing_coefficient=plac.Annotation("The weighting of the disparity loss relative to the spatial loss.",
                                           type=float, kind="option"),
 )
-def train(model_path, best_weights_path, checkpoint_path, dataset_path, logger=None,
-          num_epochs=20, batch_size=8, lr=0.0004, balancing_coefficient=0.1):
+def train_lasinger(model_path, best_weights_path, checkpoint_path, dataset_path, logger=None,
+                   num_epochs=20, batch_size=8, lr=0.0004, balancing_coefficient=0.1):
     close_logger_on_exit = False
 
     if logger is None:
@@ -69,7 +69,8 @@ def train(model_path, best_weights_path, checkpoint_path, dataset_path, logger=N
     data_loader = DataLoader(flow_dataset, batch_size=batch_size, shuffle=True)
     logger.log("Created data loader for optical flow dataset.")
 
-    model = MidasNet(model_path, non_negative=False)
+    # TODO: Does setting non_negative=True affect training like it did in my other experiments (outputs all going to zero).
+    model = MidasNet(model_path, non_negative=True)
     model = model.cuda()
     model.load_state_dict(torch.load(model_path, map_location="cpu"))
     logger.log("Loaded depth estimation model.")

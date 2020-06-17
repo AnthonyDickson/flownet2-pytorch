@@ -20,7 +20,7 @@ from Video3D.colmap_io import read_model
 from Video3D.dataset import OpticalFlowDatasetBuilder, wrap_MiDaS_transform, unwrap_MiDaS_transform
 from Video3D.inference import inference_li, inference_lasinger, create_and_save_depth
 from Video3D.io import read_video
-from Video3D.training import train, train_li
+from Video3D.training import train_lasinger, train_li
 from models import FlowNet2
 from utils.tools import TimerBlock
 
@@ -71,10 +71,6 @@ def main(colmap_output_path: str, video_path: str, checkpoint_path: str = "check
         os.makedirs(workspace_path)
 
     colmap_path = os.path.join(workspace_path, "parsed_colmap_output.pkl")
-
-    depth_estimation_model_path = os.path.join(
-        checkpoint_path, "test_local", "best_depth_Ours_Bilinear_inc_3_net_G.pth"
-    )
     optical_flow_model_path = os.path.join(checkpoint_path, "FlowNet2_checkpoint.pth.tar")
     optimised_depth_estimation_model_path = os.path.join(workspace_path, "optimised_depth_estimation_model.pt")
     optimised_dnn_checkpoint_path = os.path.join(workspace_path, "depth_estimation_model_checkpoint.pt")
@@ -91,9 +87,17 @@ def main(colmap_output_path: str, video_path: str, checkpoint_path: str = "check
     if depth_estimation_model == "li":
         train_fn = train_li
         inference_fn = inference_li
+
+        depth_estimation_model_path = os.path.join(
+            checkpoint_path, "test_local", "best_depth_Ours_Bilinear_inc_3_net_G.pth"
+        )
     elif depth_estimation_model == "lasinger":
-        train_fn = train
+        train_fn = train_lasinger
         inference_fn = inference_lasinger
+
+        depth_estimation_model_path = os.path.join(
+            checkpoint_path, "model.pt"
+        )
     else:
         raise RuntimeError("Unsupported depth estimation model: {}.".format(depth_estimation_model))
 

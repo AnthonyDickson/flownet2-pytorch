@@ -253,7 +253,7 @@ if __name__ == '__main__':
             args.validation_n_batches = np.inf if args.validation_n_batches < 0 else args.validation_n_batches
             progress = tqdm(tools.IteratorTimer(data_loader), ncols=100, total=np.minimum(len(data_loader), args.validation_n_batches), leave=True, position=offset, desc=title)
         else:
-            model.train()
+            model.train_lasinger()
             title = 'Training Epoch {}'.format(epoch)
             args.train_n_batches = np.inf if args.train_n_batches < 0 else args.train_n_batches
             progress = tqdm(tools.IteratorTimer(data_loader), ncols=120, total=np.minimum(len(data_loader), args.train_n_batches), smoothing=.9, miniters=1, leave=True, position=offset, desc=title)

@@ -1,5 +1,6 @@
 import argparse
 import os
+from typing import Optional
 
 import numpy as np
 import plac
@@ -15,8 +16,15 @@ from mannequinchallenge.models import pix2pix_model
 from utils.tools import TimerBlock
 
 
-def inference_lasinger(video_data, model_path, logger, batch_size=8):
-    model = MidasNet(model_path, non_negative=False)
+def inference_lasinger(video_data, model_path, logger: Optional[TimerBlock] = None, batch_size=8):
+    close_logger_on_exit = False
+
+    if logger is None:
+        logger = TimerBlock("Inference with Depth Estimation Network")
+        logger.__enter__()
+        close_logger_on_exit = True
+
+    model = MidasNet(model_path, non_negative=True)
     model = model.cuda()
     model.eval()
     logger.log("Loaded model weights from {}.".format(model_path))
@@ -42,9 +50,19 @@ def inference_lasinger(video_data, model_path, logger, batch_size=8):
 
     print()
 
+    if close_logger_on_exit:
+        logger.__exit__(None, None, None)
+
 
 # TODO: Make inference code DRY.
-def inference_li(video_data, model_path, logger, batch_size=8):
+def inference_li(video_data, model_path, logger: Optional[TimerBlock] = None, batch_size=8):
+    close_logger_on_exit = False
+
+    if logger is None:
+        logger = TimerBlock("Inference with Depth Estimation Network")
+        logger.__enter__()
+        close_logger_on_exit = True
+
     opt = argparse.Namespace(input='single_view', mode='Ours_Bilinear',
                              checkpoints_dir='', name='', isTrain=True,
                              gpu_ids='0', lr=0.0004, lr_policy='step', lr_decay_epoch=8)
@@ -81,26 +99,34 @@ def inference_li(video_data, model_path, logger, batch_size=8):
 
     print()
 
+    if close_logger_on_exit:
+        logger.__exit__(None, None, None)
+
 
 def create_and_save_depth(inference_fn, video_data, depth_estimation_model_path, dnn_depth_map_path, logger, batch_size):
-    depth_maps = open_memmap(
-        filename=dnn_depth_map_path,
-        dtype=np.float32,
-        mode='w+',
-        shape=(video_data.num_frames, 1, *video_data.shape)
-    )
+    try:
+        depth_maps = open_memmap(
+            filename=dnn_depth_map_path,
+            dtype=np.float32,
+            mode='w+',
+            shape=(video_data.num_frames, 1, *video_data.shape)
+        )
 
-    for batch_i, depth_map in enumerate(inference_fn(video_data, depth_estimation_model_path, logger, batch_size=batch_size)):
-        batch_start_idx = batch_size * batch_i
-        # Sometimes the last batch is a different size to the rest, so we need to use the actual batch size rather than
-        # the specified one.
-        current_batch_size = depth_map.shape[0]
-        batch_end_idx = batch_start_idx + current_batch_size
-        depth_maps[batch_start_idx:batch_end_idx] = depth_map
+        for batch_i, depth_map in enumerate(inference_fn(video_data, depth_estimation_model_path, logger, batch_size=batch_size)):
+            batch_start_idx = batch_size * batch_i
+            # Sometimes the last batch is a different size to the rest, so we need to use the actual batch size rather than
+            # the specified one.
+            current_batch_size = depth_map.shape[0]
+            batch_end_idx = batch_start_idx + current_batch_size
+            depth_maps[batch_start_idx:batch_end_idx] = depth_map
 
-    depth_maps.flush()
+        depth_maps.flush()
 
-    logger.log("Saved DNN depth maps to {}.".format(dnn_depth_map_path))
+        logger.log("Saved DNN depth maps to {}.".format(dnn_depth_map_path))
+    except:
+        logger.log("\nError occurred during creation of depth maps - deleting {}.".format(dnn_depth_map_path))
+        os.remove(dnn_depth_map_path)
+        raise
 
     return depth_maps
 
