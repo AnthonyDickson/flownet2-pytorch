@@ -84,14 +84,10 @@ class Image:
 class Camera:
     def __init__(self, id, model, width, height, params):
         self.id = int(id)
-        self.model = model
+        self.model = str(model)
         self.width = int(width)
         self.height = int(height)
-        self.focal_length, self.center_x, self.center_y, self.skew = params
-
-    """
-    Params order: focal length, center x, center y, skew
-    """
+        self.focal_length, self.center_x, self.center_y = map(float, params)
 
     @property
     def shape(self):
@@ -100,7 +96,7 @@ class Camera:
 
     def get_matrix(self):
         return np.array([
-            [self.focal_length, self.skew, self.center_x],
+            [self.focal_length, 0.0, self.center_x],
             [0.0, self.focal_length, self.center_y],
             [0.0, 0.0, 1.0]
         ])
@@ -133,7 +129,9 @@ class Camera:
         else:
             args = json.load(f)
 
-        return Camera(**args)
+        return Camera(id=args['id'], model=args['model'], width=args['width'], height=args['height'],
+                      params=[args['focal_length'], args['center_x'], args['center_y']])
+
 
 class Point3D:
     def __init__(self, id, xyz, rgb, error, image_ids, point2D_idxs):
@@ -167,6 +165,7 @@ class Point3D:
     @property
     def b(self):
         return self.rgb[2]
+
 
 CAMERA_MODELS = {
     CameraModel(model_id=0, model_name="SIMPLE_PINHOLE", num_params=3),

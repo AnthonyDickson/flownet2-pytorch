@@ -2,6 +2,7 @@ import argparse
 import math
 import os
 import pickle
+import subprocess
 import warnings
 from collections import deque
 from concurrent.futures.thread import ThreadPoolExecutor
@@ -11,6 +12,7 @@ import cv2
 import numpy as np
 import plac
 import torch
+from numpy.lib.format import open_memmap
 from torch.nn import functional as F
 from torchvision.transforms import Compose
 
@@ -26,10 +28,6 @@ from utils.tools import TimerBlock
 
 
 @plac.annotations(
-    colmap_output_path=plac.Annotation(
-        "The path to the folder containing the text files `cameras.txt`, `images.txt` and `points3D.txt`.",
-        type=str, kind="option", abbrev="c"
-    ),
     video_path=plac.Annotation(
         'The path to the source video file.',
         type=str, kind='option', abbrev='i'
@@ -51,10 +49,9 @@ from utils.tools import TimerBlock
         type=int, kind="option"
     )
 )
-def main(colmap_output_path: str, video_path: str, checkpoint_path: str = "checkpoints/",
-         workspace_path: str = "workspace/", depth_estimation_model="li", batch_size: int = 8):
+def main(video_path: str, checkpoint_path: str = "checkpoints/", workspace_path: str = "workspace/",
+         depth_estimation_model="li", batch_size: int = 8):
     print(dict(
-        colmap_output_path=colmap_output_path,
         video_path=video_path,
         checkpoint_path=checkpoint_path,
         workspace_path=workspace_path,
@@ -70,7 +67,8 @@ def main(colmap_output_path: str, video_path: str, checkpoint_path: str = "check
     if not os.path.isdir(workspace_path):
         os.makedirs(workspace_path)
 
-    colmap_path = os.path.join(workspace_path, "parsed_colmap_output.pkl")
+    frame_data_path = os.path.join(workspace_path, "frames")
+    colmap_workspace_path = os.path.join(workspace_path, "colmap")
     optical_flow_model_path = os.path.join(checkpoint_path, "FlowNet2_checkpoint.pth.tar")
     optimised_depth_estimation_model_path = os.path.join(workspace_path, "optimised_depth_estimation_model.pt")
     optimised_dnn_checkpoint_path = os.path.join(workspace_path, "depth_estimation_model_checkpoint.pt")
@@ -108,10 +106,10 @@ def main(colmap_output_path: str, video_path: str, checkpoint_path: str = "check
         if os.path.isdir(dataset_path):
             block.log("Found dataset at {}.".format(dataset_path))
         else:
-            create_optical_flow_dataset(video_data, colmap_output_path, colmap_path, sparse_depth_map_path,
+            create_optical_flow_dataset(video_data, frame_data_path, colmap_workspace_path, sparse_depth_map_path,
                                         dnn_depth_map_path, relative_depth_scale_path, dataset_path,
-                                        depth_estimation_model_path, optical_flow_model_path, block,
-                                        inference_fn, batch_size)
+                                        depth_estimation_model_path, optical_flow_model_path, block, inference_fn,
+                                        batch_size)
 
     with TimerBlock("Optimise Depth Estimation Network") as block:
         if os.path.isfile(optimised_depth_estimation_model_path):
@@ -122,13 +120,15 @@ def main(colmap_output_path: str, video_path: str, checkpoint_path: str = "check
 
     if not os.path.isfile(dnn_depth_map_path):
         with TimerBlock("Generate Depth Maps") as block:
-            create_and_save_depth(inference_fn, video_data, depth_estimation_model_path, dnn_depth_map_path, logger=block, batch_size=batch_size)
+            create_and_save_depth(inference_fn, video_data, depth_estimation_model_path, dnn_depth_map_path,
+                                  logger=block, batch_size=batch_size)
             block.log("Generated depth maps with pretrained network.")
             block.log("Saved depth maps to {}.".format(dnn_depth_map_path))
 
     if not os.path.isfile(optimised_dnn_depth_map_path):
         with TimerBlock("Generate Optimised Depth Maps") as block:
-            create_and_save_depth(inference_fn, video_data, optimised_depth_estimation_model_path, optimised_dnn_depth_map_path, logger=block, batch_size=batch_size)
+            create_and_save_depth(inference_fn, video_data, optimised_depth_estimation_model_path,
+                                  optimised_dnn_depth_map_path, logger=block, batch_size=batch_size)
             block.log("Generated depth maps with optimised network.")
             block.log("Saved depth maps to {}.".format(optimised_dnn_depth_map_path))
 
@@ -136,11 +136,11 @@ def main(colmap_output_path: str, video_path: str, checkpoint_path: str = "check
         generate_sample_video(video_path, dnn_depth_map_path, optimised_dnn_depth_map_path, sample_video_path, block)
 
 
-def create_optical_flow_dataset(video_data, colmap_output_path, colmap_path, sparse_depth_map_path,
+def create_optical_flow_dataset(video_data, frame_data_path, colmap_workspace_path, sparse_depth_map_path,
                                 dnn_depth_map_path, relative_depth_scale_path, dataset_path,
-                                depth_estimation_model_path, optical_flow_model_path, logger,
-                                inference_fn, batch_size):
-    camera, images_by_id, points3d_by_id = parse_colmap_output(colmap_output_path, colmap_path, logger)
+                                depth_estimation_model_path, optical_flow_model_path, logger, inference_fn, batch_size):
+    run_colmap(video_data, frame_data_path, colmap_workspace_path, logger)
+    camera, images_by_id, points3d_by_id = get_colmap_output(colmap_workspace_path, logger)
 
     relative_depth_scale = calculate_global_scale_adjustment_factor(video_data, camera, images_by_id,
                                                                     points3d_by_id, depth_estimation_model_path,
@@ -242,54 +242,107 @@ def create_optical_flow_dataset(video_data, colmap_output_path, colmap_path, spa
     logger.log("Saved dataset to {}.".format(dataset_path))
 
 
-def parse_colmap_output(colmap_output_path, colmap_path, logger):
-    try:
-        with open(colmap_path, 'rb') as f:
-            camera, images, points3D = pickle.load(f)
+def run_colmap(video_data, frame_data_path, colmap_workspace_path, logger):
+    # TODO: Generate masked video with Detectron2.
 
-        logger.log("Loaded parsed COLMAP output from {}.".format(colmap_path))
-    except FileNotFoundError:
-        cameras, images, points3D = read_model(
-            os.path.join(colmap_output_path, "sparse/0"),
-            ".bin"
-        )
-        logger.log("Loaded raw COLMAP output from {}.".format(colmap_output_path))
+    if not os.path.exists(frame_data_path):
+        os.makedirs(frame_data_path)
+        logger.log("Created folder for frame data at {}.".format(frame_data_path))
 
-        # Assume there is only one camera. Sometimes COLMAP can give multiple cameras I think?
-        camera = list(cameras.values())[0]
+        for frame_i, frame in enumerate(video_data):
+            frame_filename = "{:04d}.png".format(frame_i + 1)
 
-        with open(colmap_path, 'wb') as f:
-            pickle.dump((camera, images, points3D), f)
+            # If the video data is in the RGB format (as opposed to the BGR format), then it must be converted to BGR
+            # before being written to disk since that is the format OpenCV uses.
+            if video_data.is_rgb:
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-        logger.log("Saved parsed COLMAP output to {}.".format(colmap_path))
+            frame_path = os.path.join(frame_data_path, frame_filename)
+            cv2.imwrite(frame_path, frame)
+            logger.log("Wrote frame {:,d}/{:,d} to {}.\r".format(frame_i + 1, len(video_data), frame_path), end="")
+
+        print()
+
+        logger.log("Wrote frame data for COLMAP to {}.".format(frame_data_path))
+    else:
+        logger.log("Found frame data at {}.".format(frame_data_path))
+
+    if not os.path.exists(colmap_workspace_path):
+        os.makedirs(colmap_workspace_path)
+        logger.log("Created workspace folder at {}.".format(colmap_workspace_path))
+
+        logger.log("Running COLMAP reconstruction. This may take a while...")
+        colmap_process = subprocess.run([
+            'colmap', 'automatic_reconstructor',
+             '--image_path', frame_data_path,
+             '--workspace_path', colmap_workspace_path,
+             '--single_camera', '1',
+             '--quality', 'low',
+             '--data_type', 'video',
+             '--camera_model', 'SIMPLE_PINHOLE',
+             # TODO: Specify masks for dynamic objects
+         ])
+
+        if colmap_process.returncode != 0:
+            raise RuntimeError("COLMAP exited with the non-zero return code {}.".format(colmap_process.returncode))
+        else:
+            logger.log("COLMAP finished processing the video.")
+
+    else:
+        logger.log("Found COLMAP reconstruction workspace folder at {}.".format(colmap_workspace_path))
+
+
+def get_colmap_output(colmap_workspace_path, logger):
+    cameras, images, points3D = read_model(
+        os.path.join(colmap_workspace_path, "sparse/0"),
+        ".bin"
+    )
+    logger.log("Loaded raw COLMAP output from {}.".format(colmap_workspace_path))
+
+    # Assume there is only one camera. Sometimes COLMAP can give multiple cameras I think?
+    camera = list(cameras.values())[0]
+
+    if len(cameras) > 1:
+        warnings.warn("More than one camera was found for the COLMAP output located at {}. "
+                      "Expected only one camera.".format(colmap_workspace_path))
 
     return camera, images, points3D
 
 
 def generate_sparse_depth_maps(camera, images_by_id, points3d_by_id, logger, sparse_depth_map_path):
-    try:
-        sparse_depth_maps = np.load(sparse_depth_map_path)
+    if os.path.isfile(sparse_depth_map_path):
+        sparse_depth_maps = np.load(sparse_depth_map_path, mmap_mode='r')
         logger.log("Loaded sparse depth maps from {}.".format(sparse_depth_map_path))
-    except IOError:
-        num_frames = len(images_by_id)
-        sparse_depth_maps = np.zeros(shape=(num_frames, *camera.shape), dtype=np.float32)
-        height, width = camera.shape
+    else:
+        try:
+            num_frames = len(images_by_id)
 
-        for image in images_by_id.values():
-            for point in image.points2D:
-                if point.point3d_id > -1 and point.x <= width and point.y <= height:
-                    point3d = points3d_by_id[point.point3d_id]
-                    # TODO: Fix index out of bounds error with image.id. Off by one error? I think the image ids are one-based.
-                    sparse_depth_maps[image.id, int(point.y), int(point.x)] = point3d.z
+            sparse_depth_maps = open_memmap(
+                filename=sparse_depth_map_path,
+                dtype=np.float32,
+                mode='w+',
+                shape=(num_frames, 1, *camera.shape)
+            )
+            height, width = camera.shape
 
-            logger.log("Generated {}/{} sparse depth maps.\r".format(len(sparse_depth_maps), num_frames), end="")
+            for image_i, image in enumerate(images_by_id.values()):
+                for point in image.points2D:
+                    if point.point3d_id > -1 and point.x <= width and point.y <= height:
+                        point3d = points3d_by_id[point.point3d_id]
+                        # Have to subtract one from image ids since they are one-indexed to avoid index out of bounds
+                        # and off by one errors.
+                        sparse_depth_maps[image.id - 1, 0, int(point.y), int(point.x)] = point3d.z
 
-        print()
+                logger.log("Generated {:,d}/{:,d} sparse depth maps.\r".format(image_i + 1, num_frames), end="")
 
-        sparse_depth_maps = np.array(sparse_depth_maps, dtype=np.float32)
-        sparse_depth_maps = np.expand_dims(sparse_depth_maps, axis=1)
-        np.save(sparse_depth_map_path, sparse_depth_maps)
-        logger.log("Saved sparse depth maps to {}.".format(sparse_depth_map_path))
+            print()
+
+            sparse_depth_maps.flush()
+            logger.log("Saved sparse depth maps to {}.".format(sparse_depth_map_path))
+        except Exception:
+            logger.log("\nError occurred during creation of sparse depth maps - deleting {}.".format(sparse_depth_map_path))
+            os.remove(sparse_depth_map_path)
+            raise
 
     return sparse_depth_maps
 
@@ -308,7 +361,8 @@ def calculate_global_scale_adjustment_factor(video_data, camera, images_by_id, p
             depth_maps = np.load(dnn_depth_map_path)
             logger.log("Loaded DNN depth maps from {}.".format(dnn_depth_map_path))
         except IOError:
-            depth_maps = create_and_save_depth(inference_fn, video_data, depth_estimation_model_path, dnn_depth_map_path, logger, batch_size)
+            depth_maps = create_and_save_depth(inference_fn, video_data, depth_estimation_model_path,
+                                               dnn_depth_map_path, logger, batch_size)
 
             logger.log("Saved DNN depth maps to {}.".format(dnn_depth_map_path))
 

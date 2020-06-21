@@ -49,10 +49,19 @@ PyTorch implementation [4].
 4.  Run the main script. Run `python3 -m Video3D -h` for help on the command line arguments.
     - Example command: `python3 -m Video3D data/asakusa_29fps/colmap/ -i data/asakusa_29fps/source.webm -d checkpoints/model.pt -f checkpoints/FlowNet2_checkpoint.pth.tar`
 
+## Preparing Videos
+If you are using ffmpeg to resize videos, using a simple command such as: 
+```shell script
+ffmpeg -i my_1080p_video.mp4 -vf scale=-1:540 my_1080p_video-half_resolution.mp4
+```
+may result in a video of much lower quality. This is potentially due to a reduced bit-rate when re-encoding the video. 
+To preserve the quality of video you can use the libx264 codec as such:
+```shell script
+ffmpeg -i my_1080p_video.mp4 -vf scale=-1:540 -c:v libx264 -crf 18 my_1080p_video-half_resolution.mp4
+```
+You may have to install `libx264-dev` package (e.g. with `apt install libx264-dev` on Ubuntu) to get this working.
+
 ## TODO
--   Automate creation of folders etc.
--   Automate extraction of video frames.
--   Automate COLMAP reconstruction.
 -   Generate examples of frame pairs and optical flow automatically.
 -   Visualise examples of optical flow with vector field.
 -   Create 3D mesh from point clouds.

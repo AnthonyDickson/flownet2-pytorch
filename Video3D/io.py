@@ -8,10 +8,11 @@ from utils.tools import TimerBlock
 
 
 class VideoData:
-    def __init__(self, frames, fps):
+    def __init__(self, frames, fps, is_rgb=True):
         self.frames = np.array(frames)
         self.fps = fps
         self.height, self.width = self.frames.shape[-2:] if self.is_nchw else self.frames.shape[1:-1]
+        self.is_rgb = is_rgb
 
     def __iter__(self):
         return iter(self.frames)
@@ -36,6 +37,7 @@ class VideoData:
             return VideoData(self.frames.copy(), self.fps)
         else:
             return VideoData(self.frames.transpose((0, 3, 1, 2)), self.fps)
+
 
 # TODO: Refactor this method to be a static member of the VideoData class.
 def read_video(video_path, logger: Optional[TimerBlock] = None, convert_to_rgb=True):
@@ -92,7 +94,7 @@ def read_video(video_path, logger: Optional[TimerBlock] = None, convert_to_rgb=T
     if close_logger_on_exit:
         logger.__exit__(None, None, None)
 
-    return VideoData(frames, fps)
+    return VideoData(frames, fps, is_rgb=convert_to_rgb)
 
 
 def write_video(video_data, video_output_path, logger: Optional[TimerBlock] = None):

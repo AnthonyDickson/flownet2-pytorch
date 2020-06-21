@@ -112,10 +112,12 @@ def create_and_save_depth(inference_fn, video_data, depth_estimation_model_path,
             shape=(video_data.num_frames, 1, *video_data.shape)
         )
 
-        for batch_i, depth_map in enumerate(inference_fn(video_data, depth_estimation_model_path, logger, batch_size=batch_size)):
+        depth_map_generator = inference_fn(video_data, depth_estimation_model_path, logger, batch_size=batch_size)
+
+        for batch_i, depth_map in enumerate(depth_map_generator):
             batch_start_idx = batch_size * batch_i
-            # Sometimes the last batch is a different size to the rest, so we need to use the actual batch size rather than
-            # the specified one.
+            # Sometimes the last batch is a different size to the rest, so we need to use the actual batch size rather
+            # than the specified one.
             current_batch_size = depth_map.shape[0]
             batch_end_idx = batch_start_idx + current_batch_size
             depth_maps[batch_start_idx:batch_end_idx] = depth_map
@@ -123,12 +125,12 @@ def create_and_save_depth(inference_fn, video_data, depth_estimation_model_path,
         depth_maps.flush()
 
         logger.log("Saved DNN depth maps to {}.".format(dnn_depth_map_path))
-    except:
+
+        return depth_maps
+    except Exception:
         logger.log("\nError occurred during creation of depth maps - deleting {}.".format(dnn_depth_map_path))
         os.remove(dnn_depth_map_path)
         raise
-
-    return depth_maps
 
 
 @plac.annotations(
