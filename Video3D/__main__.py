@@ -9,6 +9,9 @@ from concurrent.futures.thread import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
+from detectron2.config import get_cfg
+from detectron2.engine import DefaultPredictor
+from detectron2.model_zoo import model_zoo
 import numpy as np
 import plac
 import torch
@@ -68,6 +71,7 @@ def main(video_path: str, checkpoint_path: str = "checkpoints/", workspace_path:
         os.makedirs(workspace_path)
 
     frame_data_path = os.path.join(workspace_path, "frames")
+    mask_data_path = os.path.join(workspace_path, "masks")
     colmap_workspace_path = os.path.join(workspace_path, "colmap")
     optical_flow_model_path = os.path.join(checkpoint_path, "FlowNet2_checkpoint.pth.tar")
     optimised_depth_estimation_model_path = os.path.join(workspace_path, "optimised_depth_estimation_model.pt")
@@ -106,10 +110,10 @@ def main(video_path: str, checkpoint_path: str = "checkpoints/", workspace_path:
         if os.path.isdir(dataset_path):
             block.log("Found dataset at {}.".format(dataset_path))
         else:
-            create_optical_flow_dataset(video_data, frame_data_path, colmap_workspace_path, sparse_depth_map_path,
-                                        dnn_depth_map_path, relative_depth_scale_path, dataset_path,
-                                        depth_estimation_model_path, optical_flow_model_path, block, inference_fn,
-                                        batch_size)
+            create_optical_flow_dataset(video_data, frame_data_path, colmap_workspace_path, mask_data_path,
+                                        sparse_depth_map_path, dnn_depth_map_path, relative_depth_scale_path,
+                                        dataset_path, depth_estimation_model_path, optical_flow_model_path, block,
+                                        inference_fn, batch_size)
 
     with TimerBlock("Optimise Depth Estimation Network") as block:
         if os.path.isfile(optimised_depth_estimation_model_path):
@@ -136,10 +140,11 @@ def main(video_path: str, checkpoint_path: str = "checkpoints/", workspace_path:
         generate_sample_video(video_path, dnn_depth_map_path, optimised_dnn_depth_map_path, sample_video_path, block)
 
 
-def create_optical_flow_dataset(video_data, frame_data_path, colmap_workspace_path, sparse_depth_map_path,
+def create_optical_flow_dataset(video_data, frame_data_path, colmap_workspace_path, mask_data_path,
+                                sparse_depth_map_path,
                                 dnn_depth_map_path, relative_depth_scale_path, dataset_path,
                                 depth_estimation_model_path, optical_flow_model_path, logger, inference_fn, batch_size):
-    run_colmap(video_data, frame_data_path, colmap_workspace_path, logger)
+    run_colmap(video_data, frame_data_path, mask_data_path, colmap_workspace_path, logger)
     camera, images_by_id, points3d_by_id = get_colmap_output(colmap_workspace_path, logger)
 
     relative_depth_scale = calculate_global_scale_adjustment_factor(video_data, camera, images_by_id,
@@ -242,12 +247,43 @@ def create_optical_flow_dataset(video_data, frame_data_path, colmap_workspace_pa
     logger.log("Saved dataset to {}.".format(dataset_path))
 
 
-def run_colmap(video_data, frame_data_path, colmap_workspace_path, logger):
-    # TODO: Generate masked video with Detectron2.
+def run_colmap(video_data, frame_data_path, mask_data_path, colmap_workspace_path, logger):
+    cfg = get_cfg()
+    # add project-specific config (e.g., TensorMask) here if you're not running a model in detectron2's core library
+    cfg.merge_from_file(model_zoo.get_config_file("COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"))
+    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5  # set threshold for this model
+    # Find a model from detectron2's model zoo. You can use the https://dl.fbaipublicfiles... url as well
+    cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url("COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml")
+    predictor = DefaultPredictor(cfg)
+
+    def get_mask(frame):
+        segmentation_outputs = predictor(frame)
+        masks = segmentation_outputs["instances"].pred_masks.cpu().numpy()
+        pred_classes = segmentation_outputs["instances"].pred_classes.cpu().numpy()
+        filtered_masks = []
+
+        for mask, pred_class in zip(masks, pred_classes):
+            # The class zero is "people".
+            if pred_class == 0:
+                filtered_masks.append(mask)
+
+        filtered_masks = np.array(filtered_masks)
+
+        flattened_mask = np.zeros(shape=(masks.shape[-2:]), dtype=bool)
+
+        for mask in filtered_masks:
+            flattened_mask |= mask
+
+        flattened_mask = np.stack((flattened_mask,) * 3, axis=-1)
+
+        return flattened_mask
 
     if not os.path.exists(frame_data_path):
         os.makedirs(frame_data_path)
         logger.log("Created folder for frame data at {}.".format(frame_data_path))
+
+        os.makedirs(mask_data_path)
+        logger.log("Created folder for mask data at {}.".format(mask_data_path))
 
         for frame_i, frame in enumerate(video_data):
             frame_filename = "{:04d}.png".format(frame_i + 1)
@@ -259,13 +295,25 @@ def run_colmap(video_data, frame_data_path, colmap_workspace_path, logger):
 
             frame_path = os.path.join(frame_data_path, frame_filename)
             cv2.imwrite(frame_path, frame)
-            logger.log("Wrote frame {:,d}/{:,d} to {}.\r".format(frame_i + 1, len(video_data), frame_path), end="")
+
+            mask_file_name = f"{frame_filename}.png"
+            mask_path = os.path.join(mask_data_path, mask_file_name)
+            instance_mask = get_mask(frame)
+            # Need to invert mask so that the masked areas are 'False' (zero) instead of True (one) and so COLMAP only
+            # masks out people.
+            instance_mask = ~instance_mask
+            cv2.imwrite(mask_path, instance_mask.astype(np.uint8))
+
+            logger.log(
+                f"Wrote frame and mask {frame_i + 1:,d}/{len(video_data):,d} to {frame_path} and {mask_path}.\r",
+                end=""
+            )
 
         print()
 
-        logger.log("Wrote frame data for COLMAP to {}.".format(frame_data_path))
+        logger.log(f"Wrote frame data for COLMAP to {frame_data_path} and dynamic object masks to {mask_data_path}.")
     else:
-        logger.log("Found frame data at {}.".format(frame_data_path))
+        logger.log(f"Found frame data at {frame_data_path}.")
 
     if not os.path.exists(colmap_workspace_path):
         os.makedirs(colmap_workspace_path)
@@ -274,14 +322,16 @@ def run_colmap(video_data, frame_data_path, colmap_workspace_path, logger):
         logger.log("Running COLMAP reconstruction. This may take a while...")
         colmap_process = subprocess.run([
             'colmap', 'automatic_reconstructor',
-             '--image_path', frame_data_path,
-             '--workspace_path', colmap_workspace_path,
-             '--single_camera', '1',
-             '--quality', 'low',
-             '--data_type', 'video',
-             '--camera_model', 'SIMPLE_PINHOLE',
-             # TODO: Specify masks for dynamic objects
-         ])
+            '--image_path', frame_data_path,
+            '--mask_path', mask_data_path,
+            '--workspace_path', colmap_workspace_path,
+            '--single_camera', '1',
+            '--quality', 'low',
+            '--data_type', 'video',
+            '--camera_model', 'SIMPLE_PINHOLE',
+            '--sparse', '1',
+            '--dense', '0'
+        ])
 
         if colmap_process.returncode != 0:
             raise RuntimeError("COLMAP exited with the non-zero return code {}.".format(colmap_process.returncode))
@@ -340,7 +390,8 @@ def generate_sparse_depth_maps(camera, images_by_id, points3d_by_id, logger, spa
             sparse_depth_maps.flush()
             logger.log("Saved sparse depth maps to {}.".format(sparse_depth_map_path))
         except Exception:
-            logger.log("\nError occurred during creation of sparse depth maps - deleting {}.".format(sparse_depth_map_path))
+            logger.log(
+                "\nError occurred during creation of sparse depth maps - deleting {}.".format(sparse_depth_map_path))
             os.remove(sparse_depth_map_path)
             raise
 
@@ -492,7 +543,7 @@ def generate_sample_video(video_path, dnn_depth_map_path, optimised_dnn_depth_ma
             video_writer.write(stacked_frame)
 
             num_frames_written += 1
-            logger.log("Wrote {}/{} frames.\r".format(num_frames_written, len(frames)), end="")
+            logger.log("Wrote {:,d}/{:,d} frames.\r".format(num_frames_written, len(frames)), end="")
 
     print()
 

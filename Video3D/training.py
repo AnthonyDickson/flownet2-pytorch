@@ -92,7 +92,7 @@ def train_lasinger(model_path, best_weights_path, checkpoint_path, dataset_path,
     optical_flow_mask = batch[-1]
     _, height, width = optical_flow_mask.shape
 
-    x = torch.from_numpy(np.array(np.meshgrid(range(width), range(height - 1, -1, -1)), dtype=np.float32))
+    x = torch.from_numpy(np.array(np.meshgrid(range(width), range(height)), dtype=np.float32))
     x_ = torch.ones(size=(4, *x.shape[1:]), dtype=torch.float32)
     x_[:2, :, :] = x
 
