@@ -27,15 +27,15 @@ PyTorch implementation [4].
 ## Getting Started
 1.  Setup the depth estimation models: 
     1.  Create a directory called `checkpoints` in the root project folder.
-    2.  Clone my fork of the [MiDaS repository](https://github.com/eight0153/MiDaS.git) into the project root folder and checkout the `video3d` branch:
+    2.  Clone my fork of the [MiDaS repository](https://github.com/AnthonyDickson/MiDaS.git) into the project root folder and checkout the `video3d` branch:
         ```shell script
-        git clone https://github.com/eight0153/MiDaS.git
+        git clone https://github.com/AnthonyDickson/MiDaS.git
         git checkout --track origin/video3d
         ```
     3.  Download the pretrained model weights (link is in the README.md) and place the file(s) in the `checkpoints/` folder.
-    4.  Clone my fork of the [Mannequin Challenge Code and Trained Models](https://github.com/eight0153/mannequinchallenge.git) into the project root folder:
+    4.  Clone my fork of the [Mannequin Challenge Code and Trained Models](https://github.com/AnthonyDickson/mannequinchallenge.git) into the project root folder:
         ```shell script
-        git clone https://github.com/eight0153/mannequinchallenge.git
+        git clone https://github.com/AnthonyDickson/mannequinchallenge.git
         ```
     5.  Download the model weights using the script `fetch_checkpoints.sh` and copy them to the `checkpoints/` folder:
         ```shell script
